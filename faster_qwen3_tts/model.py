@@ -4,6 +4,7 @@ FasterQwen3TTS: Real-time TTS using CUDA graph capture.
 Wrapper class that provides a Qwen3-TTS API while using
 CUDA graphs for 6-10x speedup.
 """
+import inspect
 import logging
 from pathlib import Path
 from typing import Generator, Optional, Tuple, Union
@@ -56,17 +57,39 @@ class FasterQwen3TTS:
         speech_tokenizer = getattr(getattr(base_model, "model", None), "speech_tokenizer", None)
         if speech_tokenizer is not None:
             sample_rate = getattr(speech_tokenizer, "sample_rate", None)
+            if sample_rate is None:
+                sample_rate = getattr(getattr(speech_tokenizer, "config", None), "sample_rate", None)
+            if sample_rate is None:
+                sample_rate = getattr(getattr(speech_tokenizer, "config", None), "sampling_rate", None)
 
         if sample_rate is None:
             sample_rate = getattr(base_model, "sample_rate", None)
 
         if sample_rate is None:
-            logger.warning(
-                "Could not infer sample rate from base model; defaulting to 24000 Hz."
-            )
+            model_config = getattr(getattr(base_model, "model", None), "config", None)
+            if model_config is not None:
+                sample_rate = getattr(model_config, "sample_rate", None)
+            if sample_rate is None:
+                sample_rate = getattr(model_config, "sampling_rate", None)
+
+        if sample_rate is None:
             return 24000
 
         return int(sample_rate)
+
+    @staticmethod
+    def _dtype_kwarg_name(from_pretrained) -> str:
+        """Prefer `dtype`, but stay compatible with older qwen-tts releases."""
+        try:
+            parameters = inspect.signature(from_pretrained).parameters
+        except (TypeError, ValueError):
+            return "dtype"
+
+        if "dtype" in parameters:
+            return "dtype"
+        if "torch_dtype" in parameters:
+            return "torch_dtype"
+        return "dtype"
         
     @classmethod
     def from_pretrained(
@@ -104,11 +127,14 @@ class FasterQwen3TTS:
         from .predictor_graph import PredictorGraph
         from .talker_graph import TalkerGraph
         # Load base model using qwen-tts library
+        load_kwargs = {
+            "device_map": device,
+            "attn_implementation": attn_implementation,
+            cls._dtype_kwarg_name(Qwen3TTSModel.from_pretrained): dtype,
+        }
         base_model = Qwen3TTSModel.from_pretrained(
             model_name,
-            device_map=device,
-            torch_dtype=dtype,
-            attn_implementation=attn_implementation,
+            **load_kwargs,
         )
         
         talker = base_model.model.talker

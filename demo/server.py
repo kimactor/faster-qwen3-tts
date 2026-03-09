@@ -45,11 +45,11 @@ from nano_parakeet import from_pretrained as _parakeet_from_pretrained
 
 
 _ALL_MODELS = [
-    "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-    "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-    "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    "D:/work/QWen3/Qwen3-TTS-12Hz-0.6B-Base",
+    "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-Base",
+    "D:/work/QWen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 ]
 
 _active_models_env = os.environ.get("ACTIVE_MODELS", "")
@@ -664,7 +664,7 @@ def main():
     parser = argparse.ArgumentParser(description="Faster Qwen3-TTS Demo Server")
     parser.add_argument(
         "--model",
-        default="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        default="D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-Base",
         help="Model to preload at startup (default: 1.7B-Base)",
     )
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 7860)))

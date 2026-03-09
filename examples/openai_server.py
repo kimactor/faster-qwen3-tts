@@ -278,7 +278,7 @@ def _parse_args():
     )
     p.add_argument(
         "--model",
-        default=os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+        default=os.environ.get("QWEN_TTS_MODEL", "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-Base"),
         help="HuggingFace model ID or local path (default: Qwen/Qwen3-TTS-12Hz-1.7B-Base)",
     )
     p.add_argument(
