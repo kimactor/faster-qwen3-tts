@@ -118,6 +118,44 @@ Features: voice clone (upload any WAV or use your microphone), voice design (1.7
 
 `examples/openai_server.py` exposes a `POST /v1/audio/speech` endpoint that follows the OpenAI TTS API contract, so it works out of the box with OpenWebUI, llama-swap, and any other OpenAI-compatible client.
 
+### Realtime Voice Assistant
+
+`examples/realtime_voice_assistant.py` wires microphone input, VAD, ASR, LLM response streaming, and FasterQwen3TTS playback into a local voice assistant loop.
+
+Install the local audio dependency with:
+
+```bash
+pip install "faster-qwen3-tts[realtime]"
+```
+
+Requirements:
+
+- `sounddevice`
+- `qwen_asr`
+- a local causal LLM checkpoint compatible with `transformers`
+- CUDA GPU for `FasterQwen3TTS`
+
+Example:
+
+```bash
+python examples/realtime_voice_assistant.py \
+  --asr-path D:/work/QWen3/Qwen3-ASR-1.7B \
+  --llm-path D:/work/QWen3/Qwen3-4B-Instruct-2507 \
+  --tts-model 0.6b \
+  --ref-audio ref_voice.wav \
+  --xvector-only
+```
+
+If you want ICL voice cloning instead of x-vector mode, provide a transcript that matches the reference audio exactly:
+
+```bash
+python examples/realtime_voice_assistant.py \
+  --tts-model 1.7b \
+  --ref-audio ref_voice.wav \
+  --ref-text-file ref_voice.txt \
+  --icl
+```
+
 ```bash
 pip install "faster-qwen3-tts[demo]"
 python examples/openai_server.py \

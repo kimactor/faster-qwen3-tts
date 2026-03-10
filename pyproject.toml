@@ -40,6 +40,9 @@ demo = [
     "uvicorn[standard]>=0.24.0",
     "python-multipart>=0.0.7",
 ]
+realtime = [
+    "sounddevice>=0.4.6",
+]
 
 [project.scripts]
 faster-qwen3-tts = "faster_qwen3_tts.cli:main"
