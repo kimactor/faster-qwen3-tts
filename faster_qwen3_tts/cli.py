@@ -45,20 +45,38 @@ def _stream_to_audio(gen):
 
 def cmd_clone(args):
     model = _load_model(args.model, args.device, args.dtype)
+    ref_audio = args.ref_audio
+    ref_text = args.ref_text or ""
+    voice_anchor = args.voice_anchor
+
+    if not voice_anchor and not ref_audio:
+        print("ERROR: provide --voice-anchor or --ref-audio")
+        sys.exit(2)
+    if not voice_anchor and not args.xvec_only and not ref_text:
+        print("ERROR: --ref-text is required unless --xvec-only is set")
+        sys.exit(2)
 
     if args.streaming:
         start = time.perf_counter()
         gen = model.generate_voice_clone_streaming(
             text=args.text,
             language=args.language,
-            ref_audio=args.ref_audio,
-            ref_text=args.ref_text,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            voice_anchor=voice_anchor,
             chunk_size=args.chunk_size,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
             do_sample=not args.greedy,
             repetition_penalty=args.repetition_penalty,
+            subtalker_dosample=not args.sub_greedy,
+            subtalker_top_k=args.sub_top_k,
+            subtalker_top_p=args.sub_top_p,
+            subtalker_temperature=args.sub_temperature,
+            seed=args.seed,
+            subtalker_seed=args.sub_seed,
             xvec_only=args.xvec_only,
             non_streaming_mode=args.non_streaming_mode,
         )
@@ -71,13 +89,21 @@ def cmd_clone(args):
         audio_list, sr = model.generate_voice_clone(
             text=args.text,
             language=args.language,
-            ref_audio=args.ref_audio,
-            ref_text=args.ref_text,
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            voice_anchor=voice_anchor,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
             do_sample=not args.greedy,
             repetition_penalty=args.repetition_penalty,
+            subtalker_dosample=not args.sub_greedy,
+            subtalker_top_k=args.sub_top_k,
+            subtalker_top_p=args.sub_top_p,
+            subtalker_temperature=args.sub_temperature,
+            seed=args.seed,
+            subtalker_seed=args.sub_seed,
             xvec_only=args.xvec_only,
             non_streaming_mode=args.non_streaming_mode,
         )
@@ -88,6 +114,20 @@ def cmd_clone(args):
 
     _write_audio(args.output, audio, sr)
     print(f"Wrote {args.output} (dur {audio_dur:.2f}s, RTF {rtf:.2f})")
+
+
+def cmd_anchor(args):
+    model = _load_model(args.model, args.device, args.dtype)
+    if not args.xvec_only and not args.ref_text:
+        print("ERROR: --ref-text is required unless --xvec-only is set")
+        sys.exit(2)
+    model.save_voice_anchor(
+        args.output,
+        ref_audio=args.ref_audio,
+        ref_text=args.ref_text or "",
+        xvec_only=args.xvec_only,
+    )
+    print(f"Wrote voice anchor {args.output}")
 
 
 def cmd_custom(args):
@@ -113,8 +153,15 @@ def cmd_custom(args):
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
             do_sample=not args.greedy,
             repetition_penalty=args.repetition_penalty,
+            subtalker_dosample=not args.sub_greedy,
+            subtalker_top_k=args.sub_top_k,
+            subtalker_top_p=args.sub_top_p,
+            subtalker_temperature=args.sub_temperature,
+            seed=args.seed,
+            subtalker_seed=args.sub_seed,
         )
         audio, sr = _stream_to_audio(gen)
         total_time = time.perf_counter() - start
@@ -130,8 +177,15 @@ def cmd_custom(args):
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
             do_sample=not args.greedy,
             repetition_penalty=args.repetition_penalty,
+            subtalker_dosample=not args.sub_greedy,
+            subtalker_top_k=args.sub_top_k,
+            subtalker_top_p=args.sub_top_p,
+            subtalker_temperature=args.sub_temperature,
+            seed=args.seed,
+            subtalker_seed=args.sub_seed,
         )
         audio = audio_list[0]
         total_time = time.perf_counter() - start
@@ -155,8 +209,15 @@ def cmd_design(args):
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
             do_sample=not args.greedy,
             repetition_penalty=args.repetition_penalty,
+            subtalker_dosample=not args.sub_greedy,
+            subtalker_top_k=args.sub_top_k,
+            subtalker_top_p=args.sub_top_p,
+            subtalker_temperature=args.sub_temperature,
+            seed=args.seed,
+            subtalker_seed=args.sub_seed,
         )
         audio, sr = _stream_to_audio(gen)
         total_time = time.perf_counter() - start
@@ -171,8 +232,15 @@ def cmd_design(args):
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
             do_sample=not args.greedy,
             repetition_penalty=args.repetition_penalty,
+            subtalker_dosample=not args.sub_greedy,
+            subtalker_top_k=args.sub_top_k,
+            subtalker_top_p=args.sub_top_p,
+            subtalker_temperature=args.sub_temperature,
+            seed=args.seed,
+            subtalker_seed=args.sub_seed,
         )
         audio = audio_list[0]
         total_time = time.perf_counter() - start
@@ -187,8 +255,11 @@ def cmd_serve(args):
     model = _load_model(args.model, args.device, args.dtype)
 
     if args.mode == "clone":
-        if not args.ref_audio or not args.ref_text:
-            print("ERROR: --ref-audio and --ref-text are required for clone mode")
+        if not args.voice_anchor and not args.ref_audio:
+            print("ERROR: clone mode requires --voice-anchor or --ref-audio")
+            sys.exit(2)
+        if not args.voice_anchor and not args.xvec_only and not args.ref_text:
+            print("ERROR: --ref-text is required for clone mode unless --xvec-only is set")
             sys.exit(2)
     if args.mode == "custom" and not args.speaker:
         print("ERROR: --speaker is required for custom mode")
@@ -218,13 +289,21 @@ def cmd_serve(args):
                     language=args.language,
                     ref_audio=args.ref_audio,
                     ref_text=args.ref_text,
+                    voice_anchor=args.voice_anchor,
                     chunk_size=args.chunk_size,
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_k=args.top_k,
+                    top_p=args.top_p,
                     do_sample=not args.greedy,
                     repetition_penalty=args.repetition_penalty,
-                    xvec_only=False,
+                    subtalker_dosample=not args.sub_greedy,
+                    subtalker_top_k=args.sub_top_k,
+                    subtalker_top_p=args.sub_top_p,
+                    subtalker_temperature=args.sub_temperature,
+                    seed=args.seed,
+                    subtalker_seed=args.sub_seed,
+                    xvec_only=args.xvec_only,
                     non_streaming_mode=args.non_streaming_mode,
                 )
                 audio, sr = _stream_to_audio(gen)
@@ -234,12 +313,20 @@ def cmd_serve(args):
                     language=args.language,
                     ref_audio=args.ref_audio,
                     ref_text=args.ref_text,
+                    voice_anchor=args.voice_anchor,
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_k=args.top_k,
+                    top_p=args.top_p,
                     do_sample=not args.greedy,
                     repetition_penalty=args.repetition_penalty,
-                    xvec_only=False,
+                    subtalker_dosample=not args.sub_greedy,
+                    subtalker_top_k=args.sub_top_k,
+                    subtalker_top_p=args.sub_top_p,
+                    subtalker_temperature=args.sub_temperature,
+                    seed=args.seed,
+                    subtalker_seed=args.sub_seed,
+                    xvec_only=args.xvec_only,
                     non_streaming_mode=args.non_streaming_mode,
                 )
                 audio = audio_list[0]
@@ -254,8 +341,15 @@ def cmd_serve(args):
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_k=args.top_k,
+                    top_p=args.top_p,
                     do_sample=not args.greedy,
                     repetition_penalty=args.repetition_penalty,
+                    subtalker_dosample=not args.sub_greedy,
+                    subtalker_top_k=args.sub_top_k,
+                    subtalker_top_p=args.sub_top_p,
+                    subtalker_temperature=args.sub_temperature,
+                    seed=args.seed,
+                    subtalker_seed=args.sub_seed,
                 )
                 audio, sr = _stream_to_audio(gen)
             else:
@@ -267,8 +361,15 @@ def cmd_serve(args):
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_k=args.top_k,
+                    top_p=args.top_p,
                     do_sample=not args.greedy,
                     repetition_penalty=args.repetition_penalty,
+                    subtalker_dosample=not args.sub_greedy,
+                    subtalker_top_k=args.sub_top_k,
+                    subtalker_top_p=args.sub_top_p,
+                    subtalker_temperature=args.sub_temperature,
+                    seed=args.seed,
+                    subtalker_seed=args.sub_seed,
                 )
                 audio = audio_list[0]
         else:
@@ -281,8 +382,15 @@ def cmd_serve(args):
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_k=args.top_k,
+                    top_p=args.top_p,
                     do_sample=not args.greedy,
                     repetition_penalty=args.repetition_penalty,
+                    subtalker_dosample=not args.sub_greedy,
+                    subtalker_top_k=args.sub_top_k,
+                    subtalker_top_p=args.sub_top_p,
+                    subtalker_temperature=args.sub_temperature,
+                    seed=args.seed,
+                    subtalker_seed=args.sub_seed,
                 )
                 audio, sr = _stream_to_audio(gen)
             else:
@@ -293,8 +401,15 @@ def cmd_serve(args):
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_k=args.top_k,
+                    top_p=args.top_p,
                     do_sample=not args.greedy,
                     repetition_penalty=args.repetition_penalty,
+                    subtalker_dosample=not args.sub_greedy,
+                    subtalker_top_k=args.sub_top_k,
+                    subtalker_top_p=args.sub_top_p,
+                    subtalker_temperature=args.sub_temperature,
+                    seed=args.seed,
+                    subtalker_seed=args.sub_seed,
                 )
                 audio = audio_list[0]
 
@@ -319,8 +434,15 @@ def build_parser():
         sp.add_argument("--max-new-tokens", type=int, default=2048)
         sp.add_argument("--temperature", type=float, default=0.9)
         sp.add_argument("--top-k", type=int, default=50)
+        sp.add_argument("--top-p", type=float, default=1.0)
         sp.add_argument("--repetition-penalty", type=float, default=1.05)
+        sp.add_argument("--seed", type=int, default=None, help="Talker sampling seed")
+        sp.add_argument("--sub-temperature", type=float, default=None, help="Predictor temperature")
+        sp.add_argument("--sub-top-k", type=int, default=None, help="Predictor top-k")
+        sp.add_argument("--sub-top-p", type=float, default=None, help="Predictor top-p")
+        sp.add_argument("--sub-seed", type=int, default=None, help="Predictor sampling seed")
         sp.add_argument("--greedy", action="store_true", help="Disable sampling")
+        sp.add_argument("--sub-greedy", action="store_true", help="Disable predictor sampling")
         sp.add_argument("--streaming", action="store_true", help="Use streaming generation")
         nsm_group = sp.add_mutually_exclusive_group()
         nsm_group.add_argument(
@@ -340,10 +462,19 @@ def build_parser():
 
     sp = sub.add_parser("clone", help="Voice cloning (reference audio)")
     add_common(sp)
-    sp.add_argument("--ref-audio", required=True, help="Reference audio path")
-    sp.add_argument("--ref-text", required=True, help="Reference transcript")
+    sp.add_argument("--ref-audio", help="Reference audio path")
+    sp.add_argument("--ref-text", help="Reference transcript")
+    sp.add_argument("--voice-anchor", help="Path to a saved voice anchor JSON")
     sp.add_argument("--xvec-only", action="store_true", help="Use speaker embedding only")
     sp.set_defaults(fn=cmd_clone)
+
+    sp = sub.add_parser("anchor", help="Export a reusable voice anchor JSON")
+    sp.add_argument("--model", required=True, help="Model id or local path")
+    sp.add_argument("--ref-audio", required=True, help="Reference audio path")
+    sp.add_argument("--ref-text", default="", help="Reference transcript (required for ICL)")
+    sp.add_argument("--output", required=True, help="Output anchor JSON path")
+    sp.add_argument("--xvec-only", action="store_true", help="Export x-vector-only anchor")
+    sp.set_defaults(fn=cmd_anchor)
 
     sp = sub.add_parser("custom", help="CustomVoice model (speaker IDs)")
     add_common(sp)
@@ -363,6 +494,8 @@ def build_parser():
     sp.add_argument("--language", default="Auto", help="Language (Auto, English, French, ...)")
     sp.add_argument("--ref-audio", help="Reference audio path (clone)")
     sp.add_argument("--ref-text", help="Reference transcript (clone)")
+    sp.add_argument("--voice-anchor", help="Saved voice anchor JSON (clone)")
+    sp.add_argument("--xvec-only", action="store_true", help="Use speaker embedding only in clone mode")
     sp.add_argument("--speaker", help="Speaker ID (custom)")
     sp.add_argument("--instruct", default="", help="Instruction (custom/design)")
     sp.add_argument("--streaming", action="store_true", help="Use streaming generation")
@@ -384,8 +517,15 @@ def build_parser():
     sp.add_argument("--max-new-tokens", type=int, default=2048)
     sp.add_argument("--temperature", type=float, default=0.9)
     sp.add_argument("--top-k", type=int, default=50)
+    sp.add_argument("--top-p", type=float, default=1.0)
     sp.add_argument("--repetition-penalty", type=float, default=1.05)
+    sp.add_argument("--seed", type=int, default=None, help="Talker sampling seed")
+    sp.add_argument("--sub-temperature", type=float, default=None, help="Predictor temperature")
+    sp.add_argument("--sub-top-k", type=int, default=None, help="Predictor top-k")
+    sp.add_argument("--sub-top-p", type=float, default=None, help="Predictor top-p")
+    sp.add_argument("--sub-seed", type=int, default=None, help="Predictor sampling seed")
     sp.add_argument("--greedy", action="store_true", help="Disable sampling")
+    sp.add_argument("--sub-greedy", action="store_true", help="Disable predictor sampling")
     sp.add_argument("--output-dir", default="outputs", help="Directory for output wavs")
     sp.set_defaults(fn=cmd_serve)
 

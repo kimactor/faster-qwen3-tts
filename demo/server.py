@@ -30,12 +30,14 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 # Allow running from any directory
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 try:
     from faster_qwen3_tts import FasterQwen3TTS
+    from faster_qwen3_tts.text_processing import TextNormalizer, default_pronunciation_lexicon_path
 except ImportError:
     print("Error: faster_qwen3_tts not found.")
     print("Install with:  pip install -e .  (from the repo root)")
@@ -150,6 +152,7 @@ def _prime_preset_voice_cache(model: FasterQwen3TTS) -> None:
                 continue
 
 app = FastAPI(title="Faster Qwen3-TTS Demo")
+app.mount("/assets", StaticFiles(directory=Path(__file__).parent), name="assets")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -161,6 +164,7 @@ _model_cache: OrderedDict[str, FasterQwen3TTS] = OrderedDict()
 _model_cache_max: int = int(os.environ.get("MODEL_CACHE_SIZE", "2"))
 _active_model_name: str | None = None
 _loading = False
+_text_normalizer = TextNormalizer(os.environ.get("PRONUNCIATION_LEXICON", str(default_pronunciation_lexicon_path())))
 _ref_cache: dict[str, str] = {}
 _ref_cache_lock = threading.Lock()
 _parakeet = None
@@ -222,6 +226,11 @@ async def root():
     return FileResponse(Path(__file__).parent / "index.html")
 
 
+@app.get("/digital-human")
+async def digital_human():
+    return FileResponse(Path(__file__).parent / "digital_human.html")
+
+
 @app.post("/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
     """Transcribe reference audio using nano-parakeet."""
@@ -273,6 +282,17 @@ async def get_status():
         ],
         "queue_depth": _generation_waiters,
         "cached_models": list(_model_cache.keys()),
+        "pronunciation_lexicon": str(_text_normalizer.lexicon_path) if _text_normalizer.lexicon_path else "",
+    }
+
+
+@app.post("/text/normalize")
+async def normalize_text_preview(text: str = Form(...)):
+    normalized = _text_normalizer.normalize_for_tts(text)
+    return {
+        "original": text,
+        "normalized": normalized,
+        "rules": _text_normalizer.describe_rules(),
     }
 
 
@@ -347,6 +367,7 @@ async def generate_stream(
 ):
     if not _active_model_name or _active_model_name not in _model_cache:
         raise HTTPException(status_code=400, detail="Model not loaded. Click 'Load' first.")
+    text = _text_normalizer.normalize_for_tts(text)
     if len(text) > MAX_TEXT_CHARS:
         raise HTTPException(
             status_code=400,
@@ -560,6 +581,7 @@ async def generate_non_streaming(
 ):
     if not _active_model_name or _active_model_name not in _model_cache:
         raise HTTPException(status_code=400, detail="Model not loaded. Click 'Load' first.")
+    text = _text_normalizer.normalize_for_tts(text)
     if len(text) > MAX_TEXT_CHARS:
         raise HTTPException(
             status_code=400,

@@ -33,6 +33,7 @@ def fast_generate_streaming(
     do_sample: bool = True,
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
+    seed: int | None = None,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
@@ -50,6 +51,10 @@ def fast_generate_streaming(
     for i in range(suppress_start, vocab_size):
         if i != eos_id:
             suppress_mask[i] = True
+    talker_generator = None
+    if seed is not None:
+        talker_generator = torch.Generator(device=device)
+        talker_generator.manual_seed(seed)
 
     predictor = talker.code_predictor
     talker_codec_embed = talker.get_input_embeddings()
@@ -85,6 +90,7 @@ def fast_generate_streaming(
         top_k=top_k,
         top_p=top_p,
         do_sample=do_sample,
+        generator=talker_generator,
         suppress_mask=suppress_mask,
         suppress_tokens=[eos_id] if suppress_eos else None,
     )
@@ -147,6 +153,7 @@ def fast_generate_streaming(
             top_k=top_k,
             top_p=top_p,
             do_sample=do_sample,
+            generator=talker_generator,
             suppress_mask=suppress_mask,
             suppress_tokens=[eos_id] if suppress_eos else None,
         )
@@ -204,6 +211,7 @@ def parity_generate_streaming(
     do_sample: bool = True,
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
+    seed: int | None = None,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming generation without CUDA graphs (dynamic cache).
@@ -223,6 +231,10 @@ def parity_generate_streaming(
     for i in range(suppress_start, vocab_size):
         if i != eos_id:
             suppress_mask[i] = True
+    talker_generator = None
+    if seed is not None:
+        talker_generator = torch.Generator(device=device)
+        talker_generator.manual_seed(seed)
 
     # === PREFILL ===
     t_start = time.time()
@@ -252,6 +264,7 @@ def parity_generate_streaming(
         top_k=top_k,
         top_p=top_p,
         do_sample=do_sample,
+        generator=talker_generator,
         suppress_mask=suppress_mask,
         suppress_tokens=[eos_id] if suppress_eos else None,
     )
@@ -318,6 +331,7 @@ def parity_generate_streaming(
             top_k=top_k,
             top_p=top_p,
             do_sample=do_sample,
+            generator=talker_generator,
             suppress_mask=suppress_mask,
             suppress_tokens=[eos_id] if suppress_eos else None,
         )

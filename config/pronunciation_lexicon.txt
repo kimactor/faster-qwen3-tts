@@ -1,0 +1,61 @@
+# Format:
+#   词语 ['pin1','yin2'] => 替代读法
+# Notes:
+# - The pinyin list is your pronunciation note.
+# - The optional "=>" spoken alias is what will actually be sent to TTS.
+# - Leave off the alias if you only want to keep an annotation record.
+# - Empty aliases can silence symbols that LLMs often emit but Chinese TTS should skip.
+
+我操 ['wo3','cao4']
+说服 ['shui4','fu2'] => 税服
+乐亭 ['lao4','ting2'] => 烙亭
+暇给 ['xia2','ji3'] => 遀几
+就着 ['jiu4','zhe4'] => 就这
+浩浩汤汤 ['hao4','hao4','shang1','shang1'] => 浩浩商商
+江阴马蹄酥 ['jiang1','yin1','ma3','ti2','su1']
+弹拨 ['tan2','bo1']
+弹拨乐 ['tan2','bo1','yue4']
+角色 ['jue2','se4']
+调味 ['tiao2','wei4']
+调料 ['tiao2','liao4']
+处理 ['chu3','li3']
+长三角 ['chang2','san1','jiao3']
+朝阳 ['chao2','yang2']
+重播 ['chong2','bo1']
+重复 ['chong2','fu4']
+银行行长 ['yin2','hang2','hang2','zhang3']
+落地 ['luo4','di4']
+数据 ['shu4','ju4']
+熟悉 ['shu2','xi1']
+一骑绝尘 ['yi2','qi2','jue2','chen2']
+供给 ['gong1','ji3']
+供暖 ['gong1','nuan3']
+研磨 ['yan2','mo2']
+发卡 ['fa4','qia3']
+卡壳 ['qia3','ke2']
+RAG [] => 检索增强生成
+LLM [] => 大语言模型
+ASR [] => 语音识别
+TTS [] => 语音合成
+AIGC [] => A I G C
+API [] => A P I
+GPU [] => G P U
+RTX [] => R T X
+4090 [] => 四零九零
+3090 [] => 三零九零
+4060 [] => 四零六零
+** [] =>
+__ [] =>
+* [] =>
+- [] =>
+-- [] =>
+—— [] =>
+" [] =>
+' [] =>
+“ [] =>
+” [] =>
+‘ [] =>
+’ [] =>
+` [] =>
+• [] =>
+| [] =>

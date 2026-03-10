@@ -18,6 +18,7 @@ pip install faster-qwen3-tts
 
 ```python
 from faster_qwen3_tts import FasterQwen3TTS
+import soundfile as sf
 
 model = FasterQwen3TTS.from_pretrained("Qwen/Qwen3-TTS-12Hz-0.6B-Base")
 ref_audio = "ref_audio.wav"
@@ -28,17 +29,30 @@ ref_text = (
 )
 
 # Streaming — yields audio chunks during generation
-for audio_chunk, sr, timing in model.generate_voice_clone_streaming(
+for idx, (audio_chunk, sr, timing) in enumerate(model.generate_voice_clone_streaming(
     text="What do you mean that I'm not real?", language="English",
     ref_audio=ref_audio, ref_text=ref_text,
     chunk_size=8,  # 8 steps ≈ 667ms of audio per chunk
-):
-    play(audio_chunk, sr)  # process/send each chunk immediately
+), start=1):
+    sf.write(f"chunk_{idx:03d}.wav", audio_chunk, sr)  # replace with speaker/socket output in production
 
 # Non-streaming — returns all audio at once
 audio_list, sr = model.generate_voice_clone(
     text="Hello world!", language="English",
     ref_audio=ref_audio, ref_text=ref_text,
+)
+
+# Export a reusable voice anchor once, then skip prompt extraction on later runs
+model.save_voice_anchor(
+    "narrator.anchor.json",
+    ref_audio=ref_audio,
+    ref_text=ref_text,
+    xvec_only=False,
+)
+audio_list, sr = model.generate_voice_clone(
+    text="The cached prompt path is ready.",
+    language="English",
+    voice_anchor="narrator.anchor.json",
 )
 ```
 
@@ -54,6 +68,40 @@ faster-qwen3-tts clone \
   --ref-audio ref_audio.wav \
   --ref-text "I'm confused why some people have super short timelines, yet at the same time are bullish on scaling up reinforcement learning atop LLMs. If we're actually close to a human-like learner, then this whole approach of training on verifiable outcomes is doomed." \
   --output out.wav
+```
+
+Export and reuse a voice anchor:
+
+```bash
+faster-qwen3-tts anchor \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --ref-audio ref_audio.wav \
+  --ref-text "I'm confused why some people have super short timelines..." \
+  --output narrator.anchor.json
+
+faster-qwen3-tts clone \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --voice-anchor narrator.anchor.json \
+  --text "This skips rebuilding the reference prompt each time." \
+  --language English \
+  --output out.wav
+```
+
+Split talker/predictor sampling and deterministic seeds:
+
+```bash
+faster-qwen3-tts clone \
+  --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+  --voice-anchor narrator.anchor.json \
+  --text "Lower predictor entropy often makes streaming more stable." \
+  --output tuned.wav \
+  --temperature 0.85 \
+  --top-p 0.95 \
+  --seed 1234 \
+  --sub-temperature 0.6 \
+  --sub-top-k 20 \
+  --sub-top-p 0.9 \
+  --sub-seed 5678
 ```
 
 CustomVoice (predefined speaker IDs):
@@ -118,9 +166,163 @@ Features: voice clone (upload any WAV or use your microphone), voice design (1.7
 
 `examples/openai_server.py` exposes a `POST /v1/audio/speech` endpoint that follows the OpenAI TTS API contract, so it works out of the box with OpenWebUI, llama-swap, and any other OpenAI-compatible client.
 
+It now supports reusable voice anchors too:
+
+```bash
+python examples/openai_server.py \
+  --model D:/work/QWen3/Qwen3-TTS-12Hz-0.6B-Base \
+  --voice-anchor narrator.anchor.json \
+  --language Chinese \
+  --port 8000
+```
+
 ### Realtime Voice Assistant
 
 `examples/realtime_voice_assistant.py` wires microphone input, VAD, ASR, LLM response streaming, and FasterQwen3TTS playback into a local voice assistant loop. It now streams TTS chunks into a persistent audio output stream instead of waiting for whole-sentence synthesis.
+
+It also supports:
+
+- a hot-reload pronunciation lexicon at `config/pronunciation_lexicon.txt`
+- silent-symbol cleanup for markdown-style outputs such as `**`, `-`, quotes, and backticks
+- pluggable RAG hooks via `examples/rag_backends.py`
+
+If you have already exported a voice anchor, the assistant can reuse it directly and skip rebuilding the reference prompt on startup:
+
+```bash
+python examples/realtime_voice_assistant.py \
+  --tts-model 0.6b \
+  --voice-anchor narrator.anchor.json \
+  --tts-chunk-size 8
+```
+
+If `narrator.anchor.json` or `<ref_audio>.anchor.json` exists, the assistant now auto-detects it and prefers it over rebuilding the reference prompt.
+
+For local pure-text inference, use the original 4B checkpoint:
+
+```bash
+python examples/realtime_voice_assistant.py \
+  --tts-model 0.6b \
+  --voice-anchor narrator.anchor.json \
+  --tts-chunk-size 8
+```
+
+To enable the sample RAG flow:
+
+```bash
+python examples/realtime_voice_assistant.py \
+  --tts-model 0.6b \
+  --voice-anchor narrator.anchor.json \
+  --rag-backend json-keyword \
+  --rag-source config/rag_knowledge.sample.json \
+  --rag-debug
+```
+
+To upgrade the sample flow to a local vector index:
+
+```bash
+pip install sentence-transformers
+
+python examples/build_rag_index.py \
+  --source config/rag_knowledge.sample.json \
+  --output config/rag_knowledge.sample.index.npz \
+  --embedding-model BAAI/bge-small-zh-v1.5
+
+python examples/realtime_voice_assistant.py \
+  --tts-model 0.6b \
+  --voice-anchor narrator.anchor.json \
+  --rag-backend vector-index \
+  --rag-source config/rag_knowledge.sample.json \
+  --rag-index config/rag_knowledge.sample.index.npz \
+  --rag-embedding-model BAAI/bge-small-zh-v1.5 \
+  --rag-debug
+```
+
+For a digital-human deployment, you can also organize multiple knowledge bases in one file and switch by collection / metadata:
+
+```bash
+python examples/realtime_voice_assistant.py \
+  --tts-model 0.6b \
+  --voice-anchor narrator.anchor.json \
+  --rag-backend json-keyword \
+  --rag-source config/rag_collections.sample.json \
+  --rag-collection digital_human_hall \
+  --rag-filter audience=family \
+  --rag-debug
+```
+
+To evaluate retrieval quality offline before tuning prompts:
+
+```bash
+python examples/evaluate_rag.py \
+  --dataset config/rag_eval.sample.json \
+  --rag-backend json-keyword \
+  --rag-source config/rag_collections.sample.json \
+  --top-k 3 \
+  --verbose
+```
+
+RAG extension steps are documented in `docs/RAG_WORKFLOW.md`.
+
+### Pronunciation Lexicon
+
+`config/pronunciation_lexicon.txt` follows the sibling-project style and adds an optional spoken alias:
+
+```text
+说服 ['shui4','fu2'] => 税服
+江阴马蹄酥 ['jiang1','yin1','ma3','ti2','su1']
+** [] =>
+" [] =>
+```
+
+- the pinyin list is your annotation record
+- the optional `=>` alias is what TTS actually speaks
+- empty aliases are used for symbols you want the model to skip entirely
+
+### Digital Human Frontend
+
+`demo/digital_human.html` is a browser-facing 2D digital-human page themed around Jiangyin horseshoe pastry. It streams TTS from `demo/server.py` and drives mouth movement from live audio energy for browser-side lip sync.
+
+It can now also run against `examples/realtime_voice_assistant.py` in WebSocket mode, so the browser page talks to the same ASR + LLM + RAG + streaming-TTS pipeline as the local CLI assistant.
+
+Start the demo server:
+
+```bash
+python demo/server.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:7860/digital-human
+```
+
+Or start the realtime assistant directly as a browser backend:
+
+```bash
+pip install -e ".[demo,realtime]"
+
+python examples/realtime_voice_assistant.py \
+  --serve-web \
+  --web-host 127.0.0.1 \
+  --web-port 8011 \
+  --tts-model 0.6b \
+  --voice-anchor narrator.anchor.json \
+  --rag-backend json-keyword \
+  --rag-source config/rag_collections.sample.json \
+  --rag-collection digital_human_hall
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8011/digital-human
+```
+
+This page is intentionally built as a transition layer for future upgrades:
+
+- keep the current SVG mascot and replace it later with Live2D / sprite sheets / skeletal animation
+- keep the current amplitude-driven lip sync and later swap it for phoneme/viseme alignment
+- the browser now records WAV and sends it over WebSocket to the assistant backend; you can later replace that recording layer with streaming browser ASR / VAD without changing the page shell
 
 Install the local audio dependency with:
 

@@ -13,6 +13,9 @@ Strategy:
 - Unroll the full 15-step loop for deterministic shapes
 - Capture the entire loop as a single CUDA graph
 """
+import warnings
+from typing import Optional
+
 import torch
 from transformers import StaticCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -48,6 +51,8 @@ class PredictorGraph:
         self.top_k = top_k
         self.top_p = top_p
         self.temperature = temperature
+        self.seed: Optional[int] = None
+        self._warned_seed_unsupported = False
 
         # Extract model components (references, not copies)
         cp = code_predictor
@@ -200,6 +205,38 @@ class PredictorGraph:
         torch.cuda.synchronize()
         self.captured = True
         print("CUDA graph captured!")
+
+    def prepare_sampling(
+        self,
+        *,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+        seed: Optional[int] = None,
+    ) -> None:
+        changed = (
+            self.do_sample != do_sample
+            or self.top_k != top_k
+            or self.top_p != top_p
+            or self.temperature != temperature
+        )
+        self.do_sample = do_sample
+        self.top_k = top_k
+        self.top_p = top_p
+        self.temperature = temperature
+        self.seed = seed
+
+        if seed is not None and do_sample and not self._warned_seed_unsupported:
+            warnings.warn(
+                "Predictor seed is ignored in CUDA-graph mode because torch.multinomial(generator=...) "
+                "is not capture-safe on CUDA. Talker seed still works.",
+                stacklevel=2,
+            )
+            self._warned_seed_unsupported = True
+
+        if changed and self.captured:
+            self.capture(num_warmup=1)
 
     @torch.inference_mode()
     def run(self, pred_input: torch.Tensor) -> torch.Tensor:

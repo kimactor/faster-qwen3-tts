@@ -33,6 +33,8 @@ def fast_generate(
     subtalker_top_k: Optional[int] = None,
     subtalker_top_p: Optional[float] = None,
     subtalker_temperature: Optional[float] = None,
+    seed: Optional[int] = None,
+    subtalker_seed: Optional[int] = None,
     parity_mode: bool = False,
 ) -> Tuple[Optional[torch.Tensor], dict]:
     """
@@ -48,11 +50,15 @@ def fast_generate(
     for i in range(suppress_start, vocab_size):
         if i != eos_id:
             suppress_mask[i] = True
+    talker_generator = None
+    if seed is not None:
+        talker_generator = torch.Generator(device=device)
+        talker_generator.manual_seed(seed)
 
     if parity_mode:
         suppress_tokens = [i for i in range(suppress_start, vocab_size) if i != eos_id]
         t_start = time.time()
-        talker_result = talker.generate(
+        generate_kwargs = dict(
             inputs_embeds=talker_input_embeds,
             attention_mask=attention_mask,
             trailing_text_hidden=trailing_text_hiddens,
@@ -73,6 +79,9 @@ def fast_generate(
             output_hidden_states=True,
             return_dict_in_generate=True,
         )
+        if talker_generator is not None:
+            generate_kwargs["generator"] = talker_generator
+        talker_result = talker.generate(**generate_kwargs)
         talker_codes = torch.stack(
             [hid[-1] for hid in talker_result.hidden_states if hid[-1] is not None],
             dim=1,
@@ -129,6 +138,7 @@ def fast_generate(
         top_k=top_k,
         top_p=top_p,
         do_sample=do_sample,
+        generator=talker_generator,
         suppress_mask=suppress_mask,
         suppress_tokens=[eos_id] if suppress_eos else None,
     )
@@ -192,6 +202,7 @@ def fast_generate(
             top_k=top_k,
             top_p=top_p,
             do_sample=do_sample,
+            generator=talker_generator,
             suppress_mask=suppress_mask,
             suppress_tokens=[eos_id] if suppress_eos else None,
         )

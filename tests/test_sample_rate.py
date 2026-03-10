@@ -1,4 +1,7 @@
 import types
+import sys
+
+sys.modules.setdefault("soundfile", types.SimpleNamespace())
 
 from faster_qwen3_tts.model import FasterQwen3TTS
 

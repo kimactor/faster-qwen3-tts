@@ -13,6 +13,11 @@ Usage:
         --ref-audio voice.wav --ref-text "Reference transcription" \\
         --language English
 
+    # Single default voice from a reusable anchor:
+    python examples/openai_server.py \\
+        --voice-anchor narrator.anchor.json \\
+        --language Chinese
+
     # Multiple named voices from a JSON config:
     python examples/openai_server.py --voices voices.json
 
@@ -24,7 +29,7 @@ Usage:
 
 Voices config (voices.json):
     {
-        "alloy": {"ref_audio": "voice.wav", "ref_text": "...", "language": "English"},
+        "alloy": {"voice_anchor": "narrator.anchor.json", "language": "Chinese"},
         "echo":  {"ref_audio": "voice2.wav", "ref_text": "...", "language": "English"}
     }
 
@@ -58,6 +63,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from faster_qwen3_tts.text_processing import TextNormalizer, default_pronunciation_lexicon_path
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
@@ -69,6 +76,7 @@ voices: dict = {}
 default_voice: Optional[str] = None
 SAMPLE_RATE = 24000  # updated once the model loads
 _model_lock = threading.Lock()  # prevent concurrent GPU inference
+_text_normalizer = TextNormalizer(os.environ.get("PRONUNCIATION_LEXICON", str(default_pronunciation_lexicon_path())))
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -163,6 +171,24 @@ def resolve_voice(voice_name: str) -> dict:
     )
 
 
+def _build_voice_clone_kwargs(voice_cfg: dict, text: str) -> dict:
+    kwargs = {
+        "text": text,
+        "language": voice_cfg.get("language", "Auto"),
+    }
+    if voice_cfg.get("voice_anchor"):
+        kwargs["voice_anchor"] = voice_cfg["voice_anchor"]
+    elif voice_cfg.get("ref_audio"):
+        kwargs["ref_audio"] = voice_cfg["ref_audio"]
+        kwargs["ref_text"] = voice_cfg.get("ref_text", "")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Voice config must provide either 'voice_anchor' or 'ref_audio'",
+        )
+    return kwargs
+
+
 # ---------------------------------------------------------------------------
 # Streaming helper: run sync generator in a background thread
 # ---------------------------------------------------------------------------
@@ -180,10 +206,7 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
         try:
             with _model_lock:
                 for chunk, _sr, _timing in tts_model.generate_voice_clone_streaming(
-                    text=text,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
+                    **_build_voice_clone_kwargs(voice_cfg, text),
                     chunk_size=voice_cfg.get("chunk_size", 12),
                     non_streaming_mode=False,
                 ):
@@ -224,6 +247,7 @@ async def create_speech(req: SpeechRequest):
         raise HTTPException(status_code=400, detail="'input' text is empty")
 
     voice_cfg = resolve_voice(req.voice)
+    normalized_input = _text_normalizer.normalize_for_tts(req.input)
     fmt = req.response_format.lower()
 
     _CONTENT_TYPES = {
@@ -244,12 +268,7 @@ async def create_speech(req: SpeechRequest):
 
         def _generate():
             with _model_lock:
-                return tts_model.generate_voice_clone(
-                    text=req.input,
-                    language=voice_cfg.get("language", "Auto"),
-                    ref_audio=voice_cfg["ref_audio"],
-                    ref_text=voice_cfg.get("ref_text", ""),
-                )
+                return tts_model.generate_voice_clone(**_build_voice_clone_kwargs(voice_cfg, normalized_input))
 
         audio_arrays, sr = await loop.run_in_executor(None, _generate)
         audio = audio_arrays[0] if audio_arrays else np.zeros(1, dtype=np.float32)
@@ -259,7 +278,7 @@ async def create_speech(req: SpeechRequest):
     async def audio_stream():
         if fmt == "wav":
             yield _wav_header(SAMPLE_RATE)  # stream with unknown data length
-        async for raw_chunk in _stream_chunks(voice_cfg, req.input):
+        async for raw_chunk in _stream_chunks(voice_cfg, normalized_input):
             yield raw_chunk
 
     return StreamingResponse(audio_stream(), media_type=content_type)
@@ -285,13 +304,19 @@ def _parse_args():
         "--voices",
         default=os.environ.get("QWEN_TTS_VOICES"),
         metavar="FILE",
-        help="JSON file mapping voice names to {ref_audio, ref_text, language}",
+        help="JSON file mapping voice names to {voice_anchor|ref_audio, ref_text, language}",
     )
     p.add_argument(
         "--ref-audio",
         default=os.environ.get("QWEN_TTS_REF_AUDIO"),
         metavar="FILE",
         help="Reference audio file when --voices is not used",
+    )
+    p.add_argument(
+        "--voice-anchor",
+        default=os.environ.get("QWEN_TTS_VOICE_ANCHOR"),
+        metavar="FILE",
+        help="Saved voice anchor JSON when --voices is not used",
     )
     p.add_argument(
         "--ref-text",
@@ -320,19 +345,24 @@ def main():
             voices = json.load(f)
         default_voice = next(iter(voices))
         logger.info("Loaded %d voice(s) from %s", len(voices), args.voices)
-    elif args.ref_audio:
+    elif args.voice_anchor or args.ref_audio:
         voices = {
             "default": {
+                "voice_anchor": args.voice_anchor,
                 "ref_audio": args.ref_audio,
                 "ref_text": args.ref_text,
                 "language": args.language,
             }
         }
         default_voice = "default"
-        logger.info("Using single voice from --ref-audio: %s", args.ref_audio)
+        logger.info(
+            "Using single voice from %s: %s",
+            "--voice-anchor" if args.voice_anchor else "--ref-audio",
+            args.voice_anchor or args.ref_audio,
+        )
     else:
         print(
-            "ERROR: provide --ref-audio <file> or --voices <config.json>",
+            "ERROR: provide --voice-anchor <file>, --ref-audio <file>, or --voices <config.json>",
             file=sys.stderr,
         )
         sys.exit(1)

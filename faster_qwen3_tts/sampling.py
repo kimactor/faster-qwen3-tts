@@ -36,6 +36,7 @@ def sample_logits(
     top_k: int,
     top_p: float,
     do_sample: bool,
+    generator: Optional[torch.Generator] = None,
     suppress_mask: Optional[torch.Tensor] = None,
     suppress_tokens: Optional[Iterable[int]] = None,
 ) -> torch.Tensor:
@@ -63,4 +64,4 @@ def sample_logits(
         sorted_logits[sorted_indices_to_remove] = float("-inf")
         logits = torch.full_like(logits, float("-inf"))
         logits.scatter_(-1, sorted_indices, sorted_logits)
-    return torch.multinomial(F.softmax(logits, dim=-1), 1).squeeze(-1)
+    return torch.multinomial(F.softmax(logits, dim=-1), 1, generator=generator).squeeze(-1)

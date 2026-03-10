@@ -9,7 +9,10 @@ provided by this repository.
 """
 
 import argparse
+import asyncio
+import base64
 import importlib.util
+import io
 import os
 import queue
 import re
@@ -18,21 +21,27 @@ import tempfile
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import sounddevice as sd
 import soundfile as sf
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from faster_qwen3_tts import FasterQwen3TTS
+from faster_qwen3_tts.text_processing import TextNormalizer, default_pronunciation_lexicon_path
+from rag_backends import build_rag_backend, format_rag_context, parse_metadata_filters
 
 
 def _flash_attn_available() -> bool:
@@ -57,9 +66,20 @@ class RuntimeConfig:
     tts_path_17b: str = "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-Base"
     tts_path: str = "D:/work/QWen3/Qwen3-TTS-12Hz-0.6B-Base"
     ref_audio: str = "ref_voice.wav"
+    voice_anchor: str = ""
     ref_text: str = ""
     ref_text_source: str = ""
     xvector_only_mode: bool = True
+    pronunciation_lexicon_path: str = str(default_pronunciation_lexicon_path())
+    rag_backend: str = "none"
+    rag_source: str = ""
+    rag_index: str = ""
+    rag_embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    rag_collection: str = ""
+    rag_filters: Dict[str, Tuple[str, ...]] | None = None
+    rag_top_k: int = 3
+    rag_context_chars: int = 1600
+    rag_debug: bool = False
 
     sample_rate: int = 16000
     channels: int = 1
@@ -69,8 +89,8 @@ class RuntimeConfig:
 
     rms_threshold: float = 0.015
     pre_roll_sec: float = 0.25
-    min_utterance_sec: float = 0.6
-    silence_sec: float = 0.9
+    min_utterance_sec: float = 0.35
+    silence_sec: float = 0.45
     max_utterance_sec: float = 12.0
 
     asr_min_valid_chars: int = 2
@@ -111,6 +131,9 @@ class RuntimeConfig:
     enable_flash_attn: bool = True
     asr_use_flash_attn: bool = True
     llm_use_flash_attn: bool = True
+    serve_web: bool = False
+    web_host: str = "127.0.0.1"
+    web_port: int = 8011
 
 
 def _normalize_tts_model_key(value: str) -> str:
@@ -164,6 +187,32 @@ def _resolve_ref_text(
     return "", ""
 
 
+def _resolve_voice_anchor_path(
+    explicit_anchor: Optional[str],
+    ref_audio: Optional[str],
+) -> str:
+    if explicit_anchor:
+        return explicit_anchor
+
+    candidates: List[Path] = []
+    if ref_audio:
+        ref_path = Path(ref_audio)
+        candidates.append(ref_path.with_suffix(".anchor.json"))
+        candidates.append(ref_path.parent / "narrator.anchor.json")
+    candidates.append(Path("narrator.anchor.json"))
+
+    seen = set()
+    for candidate in candidates:
+        normalized = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if candidate.exists():
+            return str(candidate)
+
+    return ""
+
+
 def apply_tts_model_preset(cfg: RuntimeConfig, model_key: str) -> RuntimeConfig:
     cfg.tts_model_key = _normalize_tts_model_key(model_key)
     if cfg.tts_model_key == "0.6b":
@@ -197,14 +246,31 @@ def build_runtime_config() -> RuntimeConfig:
     parser.add_argument("--tts-path", default=None, help="Override TTS model path")
     parser.add_argument("--tts-attn-implementation", default=None, choices=["eager", "sdpa", "flash_attention_2"])
     parser.add_argument("--ref-audio", default=None, help="Reference audio path for voice clone")
+    parser.add_argument("--voice-anchor", default=None, help="Saved voice anchor JSON for TTS")
     parser.add_argument("--ref-text", default=None, help="Reference transcript for ICL mode")
     parser.add_argument("--ref-text-file", default=None, help="Load reference transcript from file")
     parser.add_argument("--language", default=None, help="ASR/TTS language")
     parser.add_argument("--input-device-hint", default=None, help="Substring matched against microphone name")
     parser.add_argument("--tts-chunk-size", type=int, default=None, help="Streaming TTS codec chunk size")
+    parser.add_argument("--pronunciation-lexicon", default=None, help="Pronunciation/silent-symbol override file")
+    parser.add_argument("--rag-backend", default="none", choices=["none", "json-keyword", "vector-index"], help="RAG backend for assistant context injection")
+    parser.add_argument("--rag-source", default=None, help="Path to a RAG knowledge JSON file")
+    parser.add_argument("--rag-index", default=None, help="Path to a prebuilt vector RAG index (.npz)")
+    parser.add_argument("--rag-embedding-model", default=None, help="Sentence-transformers model used to build/query the vector RAG index")
+    parser.add_argument("--rag-collection", default=None, help="Collection id inside a multi-knowledge-base JSON file")
+    parser.add_argument("--rag-filter", action="append", default=None, help="Metadata filter in the form key=value1,value2 (repeatable)")
+    parser.add_argument("--rag-top-k", type=int, default=None, help="How many retrieved chunks to inject")
+    parser.add_argument("--rag-context-chars", type=int, default=None, help="Max chars of retrieved context injected into prompt")
+    parser.add_argument("--rag-debug", action="store_true", help="Print retrieved RAG chunks for each turn")
     parser.add_argument("--xvector-only", action="store_true", help="Force x-vector voice clone mode")
     parser.add_argument("--icl", action="store_true", help="Force ICL voice clone mode")
     parser.add_argument("--tts-non-streaming", action="store_true", help="Use non-streaming text prompt layout for TTS")
+    parser.add_argument("--pre-roll-sec", type=float, default=None, help="Speech detector pre-roll seconds")
+    parser.add_argument("--min-utterance-sec", type=float, default=None, help="Minimum utterance duration before auto-stop")
+    parser.add_argument("--silence-sec", type=float, default=None, help="Trailing silence needed to end an utterance")
+    parser.add_argument("--serve-web", action="store_true", help="Run a WebSocket server for the browser digital-human frontend")
+    parser.add_argument("--web-host", default=None, help="Web server host")
+    parser.add_argument("--web-port", type=int, default=None, help="Web server port")
     args = parser.parse_args()
 
     cfg = apply_tts_model_preset(RuntimeConfig(), args.tts_model)
@@ -218,12 +284,44 @@ def build_runtime_config() -> RuntimeConfig:
         cfg.tts_attn_implementation = args.tts_attn_implementation
     if args.ref_audio:
         cfg.ref_audio = args.ref_audio
+    cfg.voice_anchor = _resolve_voice_anchor_path(args.voice_anchor, cfg.ref_audio)
     if args.language:
         cfg.language = args.language
     if args.input_device_hint is not None:
         cfg.input_device_hint = args.input_device_hint
     if args.tts_chunk_size is not None:
         cfg.tts_stream_chunk_size = max(1, int(args.tts_chunk_size))
+    if args.pronunciation_lexicon is not None:
+        cfg.pronunciation_lexicon_path = args.pronunciation_lexicon
+    if args.rag_source is not None:
+        cfg.rag_source = args.rag_source
+    if args.rag_index is not None:
+        cfg.rag_index = args.rag_index
+    if args.rag_embedding_model is not None:
+        cfg.rag_embedding_model = args.rag_embedding_model
+    if args.rag_collection is not None:
+        cfg.rag_collection = args.rag_collection
+    if args.rag_filter:
+        cfg.rag_filters = parse_metadata_filters(args.rag_filter)
+    if args.rag_top_k is not None:
+        cfg.rag_top_k = max(1, int(args.rag_top_k))
+    if args.rag_context_chars is not None:
+        cfg.rag_context_chars = max(200, int(args.rag_context_chars))
+    if args.rag_debug:
+        cfg.rag_debug = True
+    cfg.rag_backend = args.rag_backend
+    if args.pre_roll_sec is not None:
+        cfg.pre_roll_sec = max(0.05, float(args.pre_roll_sec))
+    if args.min_utterance_sec is not None:
+        cfg.min_utterance_sec = max(0.1, float(args.min_utterance_sec))
+    if args.silence_sec is not None:
+        cfg.silence_sec = max(0.1, float(args.silence_sec))
+    if args.serve_web:
+        cfg.serve_web = True
+    if args.web_host is not None:
+        cfg.web_host = args.web_host
+    if args.web_port is not None:
+        cfg.web_port = int(args.web_port)
 
     cfg.ref_text, cfg.ref_text_source = _resolve_ref_text(
         ref_audio=cfg.ref_audio,
@@ -244,7 +342,7 @@ def build_runtime_config() -> RuntimeConfig:
     else:
         cfg.xvector_only_mode = not bool((cfg.ref_text or "").strip())
 
-    if not cfg.xvector_only_mode and not (cfg.ref_text or "").strip():
+    if not cfg.voice_anchor and not cfg.xvector_only_mode and not (cfg.ref_text or "").strip():
         raise ValueError("ICL mode requires --ref-text or a matching <ref_audio>.txt/<ref_audio>.lab file")
 
     return cfg
@@ -293,6 +391,59 @@ def split_for_tts(text: str, max_len: int = 140) -> List[str]:
     return out
 
 
+def _audio_to_pcm16_b64(audio: np.ndarray) -> str:
+    arr = np.asarray(audio, dtype=np.float32).squeeze()
+    pcm = np.clip(arr, -1.0, 1.0)
+    pcm = np.where(pcm < 0.0, pcm * 32768.0, pcm * 32767.0).astype(np.int16)
+    return base64.b64encode(pcm.tobytes()).decode("ascii")
+
+
+def _resample_audio(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    src_sr = int(src_sr)
+    dst_sr = int(dst_sr)
+    arr = np.asarray(audio, dtype=np.float32).squeeze()
+    if src_sr <= 0 or dst_sr <= 0 or arr.size == 0 or src_sr == dst_sr:
+        return arr
+    duration = arr.shape[0] / float(src_sr)
+    target_len = max(1, int(round(duration * dst_sr)))
+    xp = np.linspace(0.0, duration, num=arr.shape[0], endpoint=False)
+    fp = arr.astype(np.float32)
+    x_new = np.linspace(0.0, duration, num=target_len, endpoint=False)
+    return np.interp(x_new, xp, fp).astype(np.float32)
+
+
+def _decode_uploaded_audio(content: bytes, target_sr: int) -> np.ndarray:
+    audio, sr = sf.read(io.BytesIO(content), dtype="float32", always_2d=False)
+    arr = np.asarray(audio, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = arr.mean(axis=1)
+    return _resample_audio(arr, int(sr), int(target_sr))
+
+
+def _decode_pcm16_chunk(content: bytes, src_sr: int, dst_sr: int) -> np.ndarray:
+    if not content:
+        return np.zeros(0, dtype=np.float32)
+    audio = np.frombuffer(content, dtype=np.int16).astype(np.float32) / 32768.0
+    return _resample_audio(audio, int(src_sr), int(dst_sr))
+
+
+def _build_segmenter(
+    cfg: RuntimeConfig,
+    *,
+    pre_roll_sec: float | None = None,
+    min_utterance_sec: float | None = None,
+    silence_sec: float | None = None,
+) -> "AudioSegmenter":
+    local_cfg = replace(cfg)
+    if pre_roll_sec is not None:
+        local_cfg.pre_roll_sec = max(0.05, float(pre_roll_sec))
+    if min_utterance_sec is not None:
+        local_cfg.min_utterance_sec = max(0.1, float(min_utterance_sec))
+    if silence_sec is not None:
+        local_cfg.silence_sec = max(0.1, float(silence_sec))
+    return AudioSegmenter(local_cfg)
+
+
 class AudioSegmenter:
     def __init__(self, cfg: RuntimeConfig):
         self.cfg = cfg
@@ -313,6 +464,14 @@ class AudioSegmenter:
         self.frames = []
         self.total_samples = 0
         self.silence_samples = 0
+
+    def force_flush(self) -> Optional[np.ndarray]:
+        if not self.frames:
+            self.reset()
+            return None
+        audio = np.concatenate(self.frames)
+        self.reset()
+        return audio if audio.size > 0 else None
 
     def push(self, chunk: np.ndarray) -> Optional[np.ndarray]:
         x = np.asarray(chunk, dtype=np.float32).flatten()
@@ -425,7 +584,10 @@ class StreamingASR:
 class StreamingLLM:
     def __init__(self, cfg: RuntimeConfig):
         self.cfg = cfg
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        if torch.cuda.is_available():
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            dtype = torch.float32
         use_flash = cfg.enable_flash_attn and cfg.llm_use_flash_attn
         attn = _attn_impl(use_flash)
 
@@ -476,8 +638,6 @@ class StreamingLLM:
         threading.Thread(target=self.model.generate, kwargs=kwargs, daemon=True).start()
         for piece in streamer:
             yield piece
-
-
 class StreamingTTS:
     def __init__(self, cfg: RuntimeConfig):
         if not torch.cuda.is_available():
@@ -495,9 +655,13 @@ class StreamingTTS:
         print(f"[Init] TTS dtype={dtype}")
         print(f"[Init] TTS sample_rate={self.model.sample_rate}")
 
-        if not os.path.exists(cfg.ref_audio):
-            raise FileNotFoundError(f"ref audio not found: {cfg.ref_audio}")
-        if not cfg.xvector_only_mode and not (cfg.ref_text or "").strip():
+        if cfg.voice_anchor:
+            if not os.path.exists(cfg.voice_anchor):
+                raise FileNotFoundError(f"voice anchor not found: {cfg.voice_anchor}")
+        else:
+            if not os.path.exists(cfg.ref_audio):
+                raise FileNotFoundError(f"ref audio not found: {cfg.ref_audio}")
+        if not cfg.voice_anchor and not cfg.xvector_only_mode and not (cfg.ref_text or "").strip():
             raise ValueError("ref_text is required when xvector_only_mode is False")
 
     def synthesize(self, text: str) -> Optional[Tuple[np.ndarray, int]]:
@@ -511,6 +675,7 @@ class StreamingTTS:
             language=self.cfg.language,
             ref_audio=self.cfg.ref_audio,
             ref_text=self.cfg.ref_text,
+            voice_anchor=self.cfg.voice_anchor or None,
             max_new_tokens=max_tokens,
             do_sample=self.cfg.tts_do_sample,
             top_k=self.cfg.tts_top_k,
@@ -534,6 +699,7 @@ class StreamingTTS:
             language=self.cfg.language,
             ref_audio=self.cfg.ref_audio,
             ref_text=self.cfg.ref_text,
+            voice_anchor=self.cfg.voice_anchor or None,
             max_new_tokens=max_tokens,
             do_sample=self.cfg.tts_do_sample,
             top_k=self.cfg.tts_top_k,
@@ -548,6 +714,8 @@ class StreamingTTS:
 
     @staticmethod
     def speak(audio: np.ndarray, sr: int) -> None:
+        if sd is None:
+            raise RuntimeError("sounddevice is required for local speaker playback")
         sd.play(audio, sr)
         sd.wait()
 
@@ -564,6 +732,8 @@ class AudioChunkPlayer:
         self._stream = None
 
     def start(self) -> None:
+        if sd is None:
+            raise RuntimeError("sounddevice is required for local speaker playback")
         if self._stream is not None:
             return
         self._stream = sd.OutputStream(
@@ -640,6 +810,15 @@ class VoiceAssistant:
     def __init__(self, cfg: RuntimeConfig):
         self.cfg = cfg
         self.segmenter = AudioSegmenter(cfg)
+        self.text_normalizer = TextNormalizer(cfg.pronunciation_lexicon_path)
+        self.rag = build_rag_backend(
+            cfg.rag_backend,
+            cfg.rag_source,
+            index_path=cfg.rag_index,
+            embedding_model=cfg.rag_embedding_model,
+            collection_id=cfg.rag_collection,
+            filters=cfg.rag_filters,
+        )
 
         print("[Init] loading ASR...")
         self.asr = StreamingASR(cfg)
@@ -666,8 +845,11 @@ class VoiceAssistant:
         self.metrics_lock = threading.Lock()
         self.turn_counter = 0
         self.turn_metrics: Dict[int, Dict[str, Any]] = {}
+        self.dialog_lock = threading.Lock()
 
     def _resolve_input_device(self) -> Optional[int]:
+        if sd is None:
+            return None
         hint = (self.cfg.input_device_hint or "").strip().lower()
         if not hint:
             return None
@@ -686,12 +868,27 @@ class VoiceAssistant:
         return None
 
     def _build_messages(self, user_text: str) -> List[dict]:
+        rag_chunks = self.rag.retrieve(user_text, top_k=self.cfg.rag_top_k, filters=self.cfg.rag_filters)
+        rag_context = format_rag_context(rag_chunks, max_chars=self.cfg.rag_context_chars)
+        if self.cfg.rag_debug and rag_context:
+            print("[RAG]")
+            print(rag_context)
         with self.history_lock:
-            return (
-                [{"role": "system", "content": self.cfg.system_prompt}]
-                + self.history
-                + [{"role": "user", "content": user_text}]
-            )
+            messages = [{"role": "system", "content": self.cfg.system_prompt}]
+            if rag_context:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "以下是与当前问题最相关的知识库片段。"
+                            "如果内容相关，优先基于这些片段回答；如果无关，不要强行引用。\n\n"
+                            f"{rag_context}"
+                        ),
+                    }
+                )
+            messages.extend(self.history)
+            messages.append({"role": "user", "content": user_text})
+            return messages
 
     def _append_history(self, user_text: str, assistant_text: str) -> None:
         with self.history_lock:
@@ -779,7 +976,8 @@ class VoiceAssistant:
             self.audio_player.clear()
         self.segmenter.reset()
         try:
-            sd.stop()
+            if sd is not None:
+                sd.stop()
         except Exception:
             pass
         self.speaking_event.clear()
@@ -834,6 +1032,179 @@ class VoiceAssistant:
 
         print(" ".join(parts))
 
+    def _metrics_payload(self, turn_id: int) -> Dict[str, Any]:
+        metrics = self._snapshot(turn_id) or {}
+        t0 = metrics.get("ts_start")
+        t1 = metrics.get("ts_llm_first_token")
+        t2 = metrics.get("ts_llm_done")
+        t4 = metrics.get("ts_tts_play_first")
+        synth = float(metrics.get("tts_synth_total", 0.0))
+        audio = float(metrics.get("tts_audio_total", 0.0))
+
+        payload: Dict[str, Any] = {
+            "turn_id": turn_id,
+            "llm_first_token_ms": int(round((t1 - t0) * 1000.0)) if t0 and t1 else None,
+            "llm_done_ms": int(round((t2 - t0) * 1000.0)) if t0 and t2 else None,
+            "ttfa_ms": int(round((t4 - t0) * 1000.0)) if t0 and t4 else None,
+            "tts_audio_s": round(audio, 3),
+            "tts_synth_s": round(synth, 3),
+            "rtf": round((audio / synth), 3) if synth > 1e-6 else None,
+        }
+        return payload
+
+    def transcribe_audio_array(self, audio: np.ndarray) -> str:
+        text = self.asr.recognize(np.asarray(audio, dtype=np.float32))
+        return re.sub(r"\s+", "", text).strip()
+
+    def transcribe_audio_bytes(self, content: bytes) -> str:
+        audio = _decode_uploaded_audio(content, self.cfg.sample_rate)
+        return self.transcribe_audio_array(audio)
+
+    def _stream_tts_events(self, turn_id: int, epoch: int, text: str):
+        if not self.tts:
+            return
+        normalized_text = self.text_normalizer.normalize_for_tts(text)
+        if not normalized_text:
+            return
+
+        for segment in split_for_tts(normalized_text, max_len=self.cfg.tts_chunk_max_len):
+            self._mark(turn_id, "ts_tts_enqueue_first", time.monotonic())
+            first_chunk = True
+            try:
+                self.speaking_event.set()
+                for audio_chunk, sr, timing in self.tts.synthesize_stream(segment):
+                    if epoch != self._get_epoch():
+                        return
+                    if first_chunk:
+                        self._mark(turn_id, "ts_tts_play_first", time.monotonic())
+                        first_chunk = False
+                    duration_s = (len(audio_chunk) / float(sr)) if sr > 0 else 0.0
+                    synth_time = (timing.get("prefill_ms", 0.0) + timing.get("decode_ms", 0.0)) / 1000.0
+                    self._add(turn_id, "tts_audio_total", duration_s)
+                    self._add(turn_id, "tts_synth_total", synth_time)
+                    yield {
+                        "type": "audio_chunk",
+                        "turn_id": turn_id,
+                        "audio_pcm16_b64": _audio_to_pcm16_b64(audio_chunk),
+                        "sample_rate": int(sr),
+                        "duration_s": round(duration_s, 3),
+                        "timing": timing,
+                    }
+            finally:
+                self.speaking_event.clear()
+
+    def stream_dialog(self, user_text: str):
+        user_text = (user_text or "").strip()
+        if not self._is_valid_user_text(user_text):
+            raise ValueError("Empty or invalid user text")
+
+        with self.dialog_lock:
+            turn = self._new_turn(user_text)
+            turn_id = int(turn["turn_id"])
+            epoch = int(turn["epoch"])
+            messages = self._build_messages(user_text)
+            response = ""
+            tts_buf = ""
+            first_token_marked = False
+            interrupted = False
+            tts_event_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
+            tts_queue: queue.Queue[Optional[str]] = queue.Queue()
+            tts_done = threading.Event()
+
+            def drain_tts_events(wait: bool = False):
+                timeout = 0.01 if wait else 0.0
+                while True:
+                    try:
+                        event = tts_event_queue.get(timeout=timeout)
+                    except queue.Empty:
+                        break
+                    else:
+                        yield event
+                        timeout = 0.0
+
+            def tts_worker() -> None:
+                try:
+                    while True:
+                        item = tts_queue.get()
+                        if item is None:
+                            break
+                        for event in self._stream_tts_events(turn_id, epoch, item) or ():
+                            tts_event_queue.put(event)
+                finally:
+                    tts_done.set()
+
+            yield {"type": "user_text", "turn_id": turn_id, "text": user_text}
+            self.llm_generating_event.set()
+            tts_thread: Optional[threading.Thread] = None
+            if self.tts:
+                tts_thread = threading.Thread(target=tts_worker, daemon=True)
+                tts_thread.start()
+            try:
+                for chunk in self.llm.stream_chat(messages):
+                    if epoch != self._get_epoch():
+                        interrupted = True
+                        break
+
+                    now = time.monotonic()
+                    if not first_token_marked:
+                        self._mark(turn_id, "ts_llm_first_token", now)
+                        first_token_marked = True
+
+                    response += chunk
+                    tts_buf += chunk
+                    yield {
+                        "type": "assistant_text",
+                        "turn_id": turn_id,
+                        "delta": chunk,
+                        "text": response,
+                    }
+
+                    if self.tts:
+                        norm_len = len(self._normalize_text(tts_buf))
+                        hard_stop = re.search(r"[\u3002\uff01\uff1f!?]\s*$", tts_buf) is not None
+                        soft_stop = re.search(r"[\uff0c,\u3001\uff1b;\uff1a:\n]\s*$", tts_buf) is not None
+                        force_flush = norm_len >= int(self.cfg.tts_stream_force_chars)
+                        soft_flush = norm_len >= int(self.cfg.tts_stream_soft_chars) and soft_stop
+                        if hard_stop or force_flush or soft_flush:
+                            tts_queue.put(tts_buf)
+                            tts_buf = ""
+
+                    for event in drain_tts_events(wait=False):
+                        yield event
+
+                self._mark(turn_id, "ts_llm_done", time.monotonic(), only_if_none=True)
+                if interrupted:
+                    if self.tts:
+                        tts_queue.put(None)
+                        while not tts_done.is_set() or not tts_event_queue.empty():
+                            for event in drain_tts_events(wait=True):
+                                yield event
+                    yield {
+                        "type": "interrupted",
+                        "turn_id": turn_id,
+                        "metrics": self._metrics_payload(turn_id),
+                    }
+                    return
+
+                if self.tts and tts_buf.strip():
+                    tts_queue.put(tts_buf)
+
+                if self.tts:
+                    tts_queue.put(None)
+                    while not tts_done.is_set() or not tts_event_queue.empty():
+                        for event in drain_tts_events(wait=True):
+                            yield event
+
+                self._append_history(user_text, response.strip())
+                yield {
+                    "type": "done",
+                    "turn_id": turn_id,
+                    "text": response.strip(),
+                    "metrics": self._metrics_payload(turn_id),
+                }
+            finally:
+                self.llm_generating_event.clear()
+
     def _new_turn(self, user_text: str) -> Dict[str, Any]:
         epoch = self._get_epoch()
         with self.metrics_lock:
@@ -852,7 +1223,10 @@ class VoiceAssistant:
         return {"turn_id": turn_id, "epoch": epoch, "text": user_text}
 
     def _enqueue_tts_segments(self, turn_id: int, epoch: int, text: str, seq: int) -> int:
-        for segment in split_for_tts(text, max_len=self.cfg.tts_chunk_max_len):
+        normalized_text = self.text_normalizer.normalize_for_tts(text)
+        if not normalized_text:
+            return seq
+        for segment in split_for_tts(normalized_text, max_len=self.cfg.tts_chunk_max_len):
             self._mark(turn_id, "ts_tts_enqueue_first", time.monotonic())
             self.tts_queue.put({"turn_id": turn_id, "epoch": epoch, "seq": seq, "text": segment})
             seq += 1
@@ -1196,6 +1570,8 @@ class VoiceAssistant:
                 print(f"[Error] TTS stream: {exc}")
 
     def run(self) -> None:
+        if sd is None:
+            raise RuntimeError("sounddevice is required for microphone/speaker realtime mode")
         workers = [
             threading.Thread(target=self.asr_worker, daemon=True),
             threading.Thread(target=self.llm_worker, daemon=True),
@@ -1214,10 +1590,23 @@ class VoiceAssistant:
             f"asr={self.cfg.asr_use_flash_attn} llm={self.cfg.llm_use_flash_attn}"
         )
         print(f"[Config] tts_model={self.cfg.tts_model_key} tts_path={self.cfg.tts_path}")
+        print(f"[Config] llm_path={self.cfg.llm_path}")
         print(
             f"[Config] xvector_only_mode={self.cfg.xvector_only_mode} "
             f"ref_text_len={len((self.cfg.ref_text or '').strip())}"
         )
+        print(f"[Config] pronunciation_lexicon={self.cfg.pronunciation_lexicon_path}")
+        print(f"[Config] rag_backend={self.cfg.rag_backend} rag_source={self.cfg.rag_source or '-'}")
+        if self.cfg.rag_index:
+            print(f"[Config] rag_index={self.cfg.rag_index}")
+        if self.cfg.rag_backend == "vector-index":
+            print(f"[Config] rag_embedding_model={self.cfg.rag_embedding_model}")
+        if self.cfg.rag_collection:
+            print(f"[Config] rag_collection={self.cfg.rag_collection}")
+        if self.cfg.rag_filters:
+            print(f"[Config] rag_filters={self.cfg.rag_filters}")
+        if self.cfg.voice_anchor:
+            print(f"[Config] voice_anchor={self.cfg.voice_anchor}")
         if self.cfg.ref_text_source:
             print(f"[Config] ref_text_source={self.cfg.ref_text_source}")
         print(f"[Config] tts_non_streaming_mode={self.cfg.tts_non_streaming_mode}")
@@ -1259,5 +1648,249 @@ class VoiceAssistant:
             print("Assistant stopped.")
 
 
+def run_websocket_server(cfg: RuntimeConfig) -> None:
+    try:
+        import uvicorn
+        from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect
+        from fastapi.middleware.cors import CORSMiddleware
+        from fastapi.responses import FileResponse
+        from fastapi.staticfiles import StaticFiles
+    except ImportError as exc:
+        raise ImportError("Web mode requires fastapi and uvicorn. Install with: pip install -e .[demo]") from exc
+
+    assistant = VoiceAssistant(cfg)
+    app = FastAPI(title="Realtime Voice Assistant")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    root = Path(__file__).resolve().parent.parent
+    digital_human_page = root / "demo" / "digital_human.html"
+    app.mount("/assets", StaticFiles(directory=root / "demo"), name="assets")
+
+    @app.get("/")
+    async def home():
+        return FileResponse(digital_human_page)
+
+    @app.get("/digital-human")
+    async def digital_human():
+        return FileResponse(digital_human_page)
+
+    @app.get("/status")
+    async def status():
+        return {
+            "loaded": True,
+            "mode": "realtime_voice_assistant_websocket",
+            "asr_path": cfg.asr_path,
+            "llm_path": cfg.llm_path,
+            "tts_path": cfg.tts_path,
+            "language": cfg.language,
+            "voice_anchor": cfg.voice_anchor,
+            "pronunciation_lexicon": cfg.pronunciation_lexicon_path,
+            "rag_backend": cfg.rag_backend,
+            "rag_source": cfg.rag_source,
+            "rag_collection": cfg.rag_collection,
+            "rag_filters": cfg.rag_filters,
+            "pre_roll_sec": cfg.pre_roll_sec,
+            "min_utterance_sec": cfg.min_utterance_sec,
+            "silence_sec": cfg.silence_sec,
+        }
+
+    @app.post("/text/normalize")
+    async def normalize_text_preview(text: str = Form(...)):
+        normalized = assistant.text_normalizer.normalize_for_tts(text)
+        return {"original": text, "normalized": normalized}
+
+    @app.websocket("/ws/assistant")
+    async def assistant_ws(websocket: WebSocket):
+        await websocket.accept()
+        loop = asyncio.get_running_loop()
+        outgoing: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        worker_lock = threading.Lock()
+        worker_holder: Dict[str, Optional[threading.Thread]] = {"thread": None}
+        audio_state: Dict[str, Any] = {
+            "segmenter": _build_segmenter(cfg),
+            "language": cfg.language,
+            "chunk_size": cfg.tts_stream_chunk_size,
+            "streaming": False,
+            "pre_roll_sec": cfg.pre_roll_sec,
+            "min_utterance_sec": cfg.min_utterance_sec,
+            "silence_sec": cfg.silence_sec,
+        }
+
+        def emit(event: Dict[str, Any]) -> None:
+            asyncio.run_coroutine_threadsafe(outgoing.put(event), loop)
+
+        def interrupt_current() -> None:
+            assistant._interrupt_current_response()
+            emit({"type": "interrupted"})
+
+        def start_worker(user_text: str, payload_meta: Dict[str, Any], transcript: str | None = None) -> None:
+            def worker() -> None:
+                old_language = assistant.cfg.language
+                old_chunk_size = assistant.cfg.tts_stream_chunk_size
+                try:
+                    if payload_meta.get("language"):
+                        assistant.cfg.language = str(payload_meta.get("language"))
+                    if payload_meta.get("chunk_size"):
+                        assistant.cfg.tts_stream_chunk_size = max(1, int(payload_meta.get("chunk_size")))
+                    if transcript is not None:
+                        emit({"type": "transcript", "text": transcript})
+                    for event in assistant.stream_dialog(user_text):
+                        emit(event)
+                except Exception as exc:
+                    emit({"type": "error", "message": str(exc)})
+                finally:
+                    assistant.cfg.language = old_language
+                    assistant.cfg.tts_stream_chunk_size = old_chunk_size
+                    emit({"type": "request_done"})
+                    with worker_lock:
+                        worker_holder["thread"] = None
+
+            with worker_lock:
+                thread = worker_holder.get("thread")
+                if thread is not None and thread.is_alive():
+                    interrupt_current()
+                    thread.join(timeout=1.5)
+                thread = threading.Thread(target=worker, daemon=True)
+                worker_holder["thread"] = thread
+                thread.start()
+
+        def handle_audio_segment(audio: np.ndarray, payload_meta: Dict[str, Any]) -> None:
+            text = assistant.transcribe_audio_array(audio)
+            if not assistant._is_valid_user_text(text):
+                emit({"type": "transcript", "text": ""})
+                return
+            start_worker(text, payload_meta, transcript=text)
+
+        def process_audio_chunk(payload: Dict[str, Any]) -> None:
+            chunk_b64 = str(payload.get("audio_chunk_b64", "")).strip()
+            if not chunk_b64:
+                raise ValueError("audio_chunk_b64 is required")
+            src_sr = int(payload.get("sample_rate") or cfg.sample_rate)
+            audio_chunk = _decode_pcm16_chunk(base64.b64decode(chunk_b64), src_sr, cfg.sample_rate)
+            segmenter = audio_state["segmenter"]
+            was_active = bool(segmenter.active)
+            segment = segmenter.push(audio_chunk)
+            if (not was_active) and segmenter.active:
+                emit({"type": "listening", "state": "speech_start"})
+            if segment is not None:
+                emit({"type": "listening", "state": "speech_end"})
+                handle_audio_segment(
+                    segment,
+                    {
+                        "language": audio_state.get("language"),
+                        "chunk_size": audio_state.get("chunk_size"),
+                    },
+                )
+
+        def flush_audio_stream() -> None:
+            segmenter = audio_state["segmenter"]
+            flushed = segmenter.force_flush()
+            if flushed is not None and flushed.size > 0:
+                emit({"type": "listening", "state": "speech_end"})
+                handle_audio_segment(
+                    flushed,
+                    {
+                        "language": audio_state.get("language"),
+                        "chunk_size": audio_state.get("chunk_size"),
+                    },
+                )
+
+        async def sender_loop() -> None:
+            while True:
+                event = await outgoing.get()
+                await websocket.send_json(event)
+
+        sender_task = asyncio.create_task(sender_loop())
+        await outgoing.put(
+            {
+                "type": "ready",
+                "message": "assistant websocket ready",
+                "status": {
+                    "language": cfg.language,
+                    "rag_backend": cfg.rag_backend,
+                    "rag_collection": cfg.rag_collection,
+                },
+            }
+        )
+
+        try:
+            while True:
+                payload = await websocket.receive_json()
+                action = str(payload.get("type", "")).strip()
+                if action == "text":
+                    start_worker(
+                        str(payload.get("text", "")).strip(),
+                        payload,
+                    )
+                elif action == "audio":
+                    audio_b64 = str(payload.get("audio_b64", "")).strip()
+                    if not audio_b64:
+                        await outgoing.put({"type": "error", "message": "audio_b64 is required"})
+                        continue
+                    try:
+                        text = assistant.transcribe_audio_bytes(base64.b64decode(audio_b64))
+                    except Exception as exc:
+                        await outgoing.put({"type": "error", "message": str(exc)})
+                        continue
+                    start_worker(text, payload, transcript=text)
+                elif action == "audio_start":
+                    audio_state["pre_roll_sec"] = max(0.05, float(payload.get("pre_roll_sec") or cfg.pre_roll_sec))
+                    audio_state["min_utterance_sec"] = max(
+                        0.1,
+                        float(payload.get("min_utterance_sec") or cfg.min_utterance_sec),
+                    )
+                    audio_state["silence_sec"] = max(0.1, float(payload.get("silence_sec") or cfg.silence_sec))
+                    audio_state["segmenter"] = _build_segmenter(
+                        cfg,
+                        pre_roll_sec=audio_state["pre_roll_sec"],
+                        min_utterance_sec=audio_state["min_utterance_sec"],
+                        silence_sec=audio_state["silence_sec"],
+                    )
+                    audio_state["language"] = str(payload.get("language") or cfg.language)
+                    audio_state["chunk_size"] = max(1, int(payload.get("chunk_size") or cfg.tts_stream_chunk_size))
+                    audio_state["streaming"] = True
+                    await outgoing.put(
+                        {
+                            "type": "listening",
+                            "state": "armed",
+                            "silence_sec": audio_state["silence_sec"],
+                            "min_utterance_sec": audio_state["min_utterance_sec"],
+                        }
+                    )
+                elif action == "audio_chunk":
+                    try:
+                        process_audio_chunk(payload)
+                    except Exception as exc:
+                        await outgoing.put({"type": "error", "message": str(exc)})
+                elif action == "audio_end":
+                    audio_state["streaming"] = False
+                    flush_audio_stream()
+                    await outgoing.put({"type": "listening", "state": "idle"})
+                elif action == "interrupt":
+                    interrupt_current()
+                elif action == "normalize":
+                    normalized = assistant.text_normalizer.normalize_for_tts(str(payload.get("text", "")))
+                    await outgoing.put({"type": "normalized", "normalized": normalized})
+                elif action == "ping":
+                    await outgoing.put({"type": "pong"})
+                else:
+                    await outgoing.put({"type": "error", "message": f"Unknown action: {action}"})
+        except WebSocketDisconnect:
+            interrupt_current()
+        finally:
+            sender_task.cancel()
+
+    print(f"[Web] serving digital human on http://{cfg.web_host}:{cfg.web_port}/digital-human")
+    uvicorn.run(app, host=cfg.web_host, port=int(cfg.web_port), log_level="info")
+
+
 if __name__ == "__main__":
-    VoiceAssistant(build_runtime_config()).run()
+    runtime_cfg = build_runtime_config()
+    if runtime_cfg.serve_web:
+        run_websocket_server(runtime_cfg)
+    else:
+        VoiceAssistant(runtime_cfg).run()

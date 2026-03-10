@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Realtime Voice Assistant</title>
+  <link rel="stylesheet" href="/assets/digital_human.css">
+</head>
+<body class="state-idle">
+  <div class="shell">
+    <section class="panel stage">
+      <div class="topbar">
+        <div class="title-wrap">
+          <div class="eyebrow"><span class="eyebrow-dot"></span><span data-i18n="eyebrow"></span></div>
+          <h1 data-i18n="title"></h1>
+          <div class="subtitle" data-i18n="subtitle"></div>
+        </div>
+        <div class="toolbar">
+          <button id="toggleConsoleBtn" class="icon-btn" data-i18n="toggle_console_hide"></button>
+        </div>
+      </div>
+
+      <div class="hero">
+        <div class="avatar-card">
+          <div class="avatar-status">
+            <div class="status-chip"><span class="pulse"></span><span id="assistantStateText"></span></div>
+            <div class="small" id="connectionText"></div>
+          </div>
+
+          <div class="avatar-scene">
+            <div class="avatar-frame">
+              <svg viewBox="0 0 360 420" width="100%" height="100%" aria-hidden="true">
+                <defs>
+                  <linearGradient id="pastryBody" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0%" stop-color="#f7d39d"></stop>
+                    <stop offset="100%" stop-color="#db9f52"></stop>
+                  </linearGradient>
+                  <linearGradient id="pastryEdge" x1="0" x2="1" y1="0" y2="1">
+                    <stop offset="0%" stop-color="#fff6dd"></stop>
+                    <stop offset="100%" stop-color="#c8742b"></stop>
+                  </linearGradient>
+                </defs>
+                <g opacity="0.16"><ellipse cx="180" cy="344" rx="122" ry="28" fill="#a86933"></ellipse></g>
+                <g transform="translate(50 38)">
+                  <path d="M262 132c0 92-51 166-132 166S0 224 0 132 78 0 130 0s132 40 132 132z" fill="url(#pastryBody)" stroke="url(#pastryEdge)" stroke-width="8"></path>
+                  <path d="M214 88c0 58-33 116-84 141-57-22-92-74-92-140 0-21 6-42 17-59 24 19 46 29 75 29 38 0 65-11 89-29 9 16 15 37 15 58z" fill="rgba(255,243,214,0.58)"></path>
+                  <path d="M101 20c-22 15-36 41-40 72" fill="none" stroke="rgba(255,255,255,0.55)" stroke-linecap="round" stroke-width="10"></path>
+                  <path d="M146 14c46 10 88 42 103 87" fill="none" stroke="rgba(255,255,255,0.36)" stroke-linecap="round" stroke-width="10"></path>
+                  <g id="faceGroup" transform="translate(0 8)">
+                    <g id="eyeLeft">
+                      <ellipse cx="98" cy="122" rx="20" ry="23" fill="#3f240f"></ellipse>
+                      <circle cx="105" cy="114" r="6" fill="#fffdf4"></circle>
+                    </g>
+                    <g id="eyeRight">
+                      <ellipse cx="166" cy="122" rx="20" ry="23" fill="#3f240f"></ellipse>
+                      <circle cx="173" cy="114" r="6" fill="#fffdf4"></circle>
+                    </g>
+                    <ellipse cx="132" cy="162" rx="12" ry="8" fill="#8d5224" opacity="0.55"></ellipse>
+                    <ellipse cx="72" cy="156" rx="16" ry="10" fill="#f1b1a0" opacity="0.45"></ellipse>
+                    <ellipse cx="192" cy="156" rx="16" ry="10" fill="#f1b1a0" opacity="0.45"></ellipse>
+                    <g transform="translate(132 194)">
+                      <ellipse cx="0" cy="0" rx="34" ry="22" fill="#5b2518"></ellipse>
+                      <ellipse id="mouthInner" cx="0" cy="6" rx="18" ry="10" fill="#f08f8f"></ellipse>
+                      <path id="smileLine" d="M-32 -3c15 10 49 10 64 0" fill="none" stroke="#7b3421" stroke-linecap="round" stroke-width="7"></path>
+                    </g>
+                  </g>
+                  <g transform="translate(33 251)">
+                    <path d="M0 20c35 17 64 24 98 24 36 0 71-8 114-24 7 24 13 54 16 84H10c3-30 8-60 17-84z" fill="#4d97a6"></path>
+                    <path d="M36 8c22 10 53 17 94 17 43 0 77-8 102-18l13 31c-38 18-77 27-115 27-38 0-73-7-108-23z" fill="#6ac5d2"></path>
+                    <circle cx="50" cy="78" r="8" fill="#fff7ef"></circle>
+                    <circle cx="208" cy="78" r="8" fill="#fff7ef"></circle>
+                  </g>
+                </g>
+              </svg>
+            </div>
+          </div>
+
+          <div class="avatar-hint">
+            <div class="hint-grid">
+              <div class="mini-card"><div class="mini-label" data-i18n="hint_mic_label"></div><div class="mini-value" id="listeningStateText"></div></div>
+              <div class="mini-card"><div class="mini-label" data-i18n="hint_tts_label"></div><div class="mini-value" id="playbackStateText"></div></div>
+              <div class="mini-card"><div class="mini-label" data-i18n="hint_vad_label"></div><div class="mini-value" id="vadSummaryText"></div></div>
+              <div class="mini-card"><div class="mini-label" data-i18n="hint_backend_label"></div><div class="mini-value" id="backendSummaryText"></div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="chat-card">
+          <div class="section-head">
+            <div>
+              <div class="section-title" data-i18n="chat_title"></div>
+              <div class="section-meta" data-i18n="chat_meta"></div>
+            </div>
+            <button id="clearChatBtn" class="ghost" data-i18n="clear_chat"></button>
+          </div>
+          <div id="chatLog" class="chat-log"></div>
+          <div>
+            <div class="mini-label" data-i18n="transcript_title"></div>
+            <div id="transcriptBox" class="transcript-box"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="controls-card">
+        <div class="input-block">
+          <label class="mini-label" for="textInput" data-i18n="input_label"></label>
+          <textarea id="textInput" data-i18n-placeholder="input_placeholder"></textarea>
+        </div>
+        <div class="actions">
+          <button id="sendTextBtn" class="primary" data-i18n="send_text"></button>
+          <button id="toggleMicBtn" class="secondary" data-i18n="start_mic"></button>
+          <button id="previewBtn" class="secondary" data-i18n="preview_normalize"></button>
+          <button id="interruptBtn" class="ghost" data-i18n="interrupt"></button>
+        </div>
+        <div class="stats-grid">
+          <div class="stat"><strong data-i18n="metric_ttfa"></strong><span id="ttfaStat">--</span></div>
+          <div class="stat"><strong data-i18n="metric_llm"></strong><span id="llmStat">--</span></div>
+          <div class="stat"><strong data-i18n="metric_rtf"></strong><span id="rtfStat">--</span></div>
+          <div class="stat"><strong data-i18n="metric_tts"></strong><span id="ttsStat">--</span></div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="panel console">
+      <div class="console-card">
+        <div class="console-top">
+          <div>
+            <div class="console-title" data-i18n="console_title"></div>
+            <div class="small" data-i18n="console_subtitle"></div>
+          </div>
+          <button id="reconnectBtn" class="secondary" data-i18n="reconnect"></button>
+        </div>
+
+        <div class="console-stack">
+          <div class="console-item"><strong data-i18n="console_runtime"></strong><code id="runtimeStatus"></code></div>
+          <div class="console-item"><strong data-i18n="console_normalized"></strong><pre id="normalizedPreview"></pre></div>
+        </div>
+
+        <details class="details">
+          <summary data-i18n="advanced_params"></summary>
+          <div class="form-grid">
+            <div class="field">
+              <label for="languageSelect" data-i18n="field_language"></label>
+              <select id="languageSelect">
+                <option value="Chinese">Chinese</option>
+                <option value="English">English</option>
+                <option value="Japanese">Japanese</option>
+              </select>
+            </div>
+            <div class="field"><label for="chunkSizeInput" data-i18n="field_chunk"></label><input id="chunkSizeInput" type="number" min="1" step="1" value="8"></div>
+            <div class="field"><label for="preRollInput" data-i18n="field_preroll"></label><input id="preRollInput" type="number" min="0.05" step="0.05" value="0.20"></div>
+            <div class="field"><label for="minUtteranceInput" data-i18n="field_min_utt"></label><input id="minUtteranceInput" type="number" min="0.10" step="0.05" value="0.35"></div>
+            <div class="field"><label for="silenceInput" data-i18n="field_silence"></label><input id="silenceInput" type="number" min="0.10" step="0.05" value="0.45"></div>
+          </div>
+        </details>
+
+        <div id="consoleLog" class="console-log"></div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="/assets/digital_human.js"></script>
+</body>
+</html>
