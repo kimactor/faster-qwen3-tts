@@ -120,7 +120,7 @@ Features: voice clone (upload any WAV or use your microphone), voice design (1.7
 
 ### Realtime Voice Assistant
 
-`examples/realtime_voice_assistant.py` wires microphone input, VAD, ASR, LLM response streaming, and FasterQwen3TTS playback into a local voice assistant loop.
+`examples/realtime_voice_assistant.py` wires microphone input, VAD, ASR, LLM response streaming, and FasterQwen3TTS playback into a local voice assistant loop. It now streams TTS chunks into a persistent audio output stream instead of waiting for whole-sentence synthesis.
 
 Install the local audio dependency with:
 
@@ -143,6 +143,7 @@ python examples/realtime_voice_assistant.py \
   --llm-path D:/work/QWen3/Qwen3-4B-Instruct-2507 \
   --tts-model 0.6b \
   --ref-audio ref_voice.wav \
+  --tts-chunk-size 8 \
   --xvector-only
 ```
 

@@ -100,6 +100,7 @@ class RuntimeConfig:
     tts_top_p: float = 1.0
     tts_temperature: float = 0.9
     tts_repetition_penalty: float = 1.05
+    tts_stream_chunk_size: int = 8
     tts_chunk_max_len: int = 140
     tts_batch_wait_ms: int = 25
     tts_stream_soft_chars: int = 18
@@ -200,6 +201,7 @@ def build_runtime_config() -> RuntimeConfig:
     parser.add_argument("--ref-text-file", default=None, help="Load reference transcript from file")
     parser.add_argument("--language", default=None, help="ASR/TTS language")
     parser.add_argument("--input-device-hint", default=None, help="Substring matched against microphone name")
+    parser.add_argument("--tts-chunk-size", type=int, default=None, help="Streaming TTS codec chunk size")
     parser.add_argument("--xvector-only", action="store_true", help="Force x-vector voice clone mode")
     parser.add_argument("--icl", action="store_true", help="Force ICL voice clone mode")
     parser.add_argument("--tts-non-streaming", action="store_true", help="Use non-streaming text prompt layout for TTS")
@@ -220,6 +222,8 @@ def build_runtime_config() -> RuntimeConfig:
         cfg.language = args.language
     if args.input_device_hint is not None:
         cfg.input_device_hint = args.input_device_hint
+    if args.tts_chunk_size is not None:
+        cfg.tts_stream_chunk_size = max(1, int(args.tts_chunk_size))
 
     cfg.ref_text, cfg.ref_text_source = _resolve_ref_text(
         ref_audio=cfg.ref_audio,
@@ -519,10 +523,117 @@ class StreamingTTS:
         audio = wavs[0] if isinstance(wavs, (list, tuple)) else wavs
         return np.asarray(audio, dtype=np.float32).squeeze(), int(sr)
 
+    def synthesize_stream(self, text: str):
+        text = (text or "").strip()
+        if not text:
+            return
+
+        max_tokens = min(self.cfg.tts_max_new_tokens, max(180, len(text) * 20))
+        for audio_chunk, sr, timing in self.model.generate_voice_clone_streaming(
+            text=text,
+            language=self.cfg.language,
+            ref_audio=self.cfg.ref_audio,
+            ref_text=self.cfg.ref_text,
+            max_new_tokens=max_tokens,
+            do_sample=self.cfg.tts_do_sample,
+            top_k=self.cfg.tts_top_k,
+            top_p=self.cfg.tts_top_p,
+            temperature=self.cfg.tts_temperature,
+            repetition_penalty=self.cfg.tts_repetition_penalty,
+            xvec_only=self.cfg.xvector_only_mode,
+            non_streaming_mode=self.cfg.tts_non_streaming_mode,
+            chunk_size=self.cfg.tts_stream_chunk_size,
+        ):
+            yield np.asarray(audio_chunk, dtype=np.float32).squeeze(), int(sr), timing
+
     @staticmethod
     def speak(audio: np.ndarray, sr: int) -> None:
         sd.play(audio, sr)
         sd.wait()
+
+
+class AudioChunkPlayer:
+    def __init__(self, sample_rate: int):
+        self.sample_rate = int(sample_rate)
+        self._lock = threading.Lock()
+        self._drain = threading.Condition(self._lock)
+        self._queued: deque[np.ndarray] = deque()
+        self._current = np.zeros(0, dtype=np.float32)
+        self._current_pos = 0
+        self._pending_samples = 0
+        self._stream = None
+
+    def start(self) -> None:
+        if self._stream is not None:
+            return
+        self._stream = sd.OutputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="float32",
+            callback=self._callback,
+        )
+        self._stream.start()
+
+    def stop(self) -> None:
+        if self._stream is None:
+            return
+        self._stream.stop()
+        self._stream.close()
+        self._stream = None
+
+    def enqueue(self, audio: np.ndarray) -> None:
+        chunk = np.asarray(audio, dtype=np.float32).flatten()
+        if chunk.size == 0:
+            return
+        with self._lock:
+            self._queued.append(chunk.copy())
+            self._pending_samples += int(chunk.size)
+            self._drain.notify_all()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._queued.clear()
+            self._current = np.zeros(0, dtype=np.float32)
+            self._current_pos = 0
+            self._pending_samples = 0
+            self._drain.notify_all()
+
+    def wait_until_idle(self, timeout: Optional[float] = None) -> bool:
+        with self._lock:
+            return self._drain.wait_for(lambda: self._pending_samples <= 0, timeout=timeout)
+
+    def pending_seconds(self) -> float:
+        with self._lock:
+            return float(self._pending_samples) / float(self.sample_rate)
+
+    def _callback(self, outdata, frames, _time_info, status) -> None:
+        if status:
+            print(f"[AudioOut] status: {status}")
+        out = outdata[:, 0]
+        out.fill(0)
+
+        with self._lock:
+            i = 0
+            while i < frames:
+                if self._current_pos >= self._current.size:
+                    if self._queued:
+                        self._current = self._queued.popleft()
+                        self._current_pos = 0
+                    else:
+                        self._current = np.zeros(0, dtype=np.float32)
+                        break
+
+                take = min(frames - i, self._current.size - self._current_pos)
+                if take <= 0:
+                    break
+                out[i:i + take] = self._current[self._current_pos:self._current_pos + take]
+                self._current_pos += take
+                self._pending_samples -= take
+                i += take
+
+            if self._pending_samples <= 0 and not self._queued and self._current_pos >= self._current.size:
+                self._pending_samples = 0
+                self._drain.notify_all()
 
 
 class VoiceAssistant:
@@ -541,6 +652,7 @@ class VoiceAssistant:
         self.text_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=8)
         self.tts_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=32)
         self.tts_ready_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=64)
+        self.audio_player = AudioChunkPlayer(self.tts.model.sample_rate) if self.tts else None
         self.stop_event = threading.Event()
         self.speaking_event = threading.Event()
         self.llm_generating_event = threading.Event()
@@ -628,6 +740,7 @@ class VoiceAssistant:
             or (not self.text_queue.empty())
             or (not self.tts_queue.empty())
             or (not self.tts_ready_queue.empty())
+            or (self.audio_player is not None and self.audio_player.pending_seconds() > 0.05)
         )
 
     def _extract_interrupt_query(self, text: str) -> Optional[str]:
@@ -662,6 +775,8 @@ class VoiceAssistant:
         self._clear_queue(self.text_queue)
         self._clear_queue(self.tts_queue)
         self._clear_queue(self.tts_ready_queue)
+        if self.audio_player is not None:
+            self.audio_player.clear()
         self.segmenter.reset()
         try:
             sd.stop()
@@ -1038,14 +1153,55 @@ class VoiceAssistant:
             if not did_work:
                 time.sleep(0.005)
 
+    def tts_stream_worker(self) -> None:
+        if not self.tts or self.audio_player is None:
+            return
+
+        while not self.stop_event.is_set():
+            try:
+                item = self.tts_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            item_epoch = int(item.get("epoch", -1))
+            if item_epoch != self._get_epoch():
+                continue
+
+            turn_id = int(item["turn_id"])
+            if item.get("eot"):
+                self.audio_player.wait_until_idle(timeout=30.0)
+                self.speaking_event.clear()
+                self._print_turn_metrics(turn_id)
+                continue
+
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+
+            try:
+                self.speaking_event.set()
+                first_chunk = True
+                for audio_chunk, sr, timing in self.tts.synthesize_stream(text):
+                    if item_epoch != self._get_epoch() or self.stop_event.is_set():
+                        break
+                    if first_chunk:
+                        self._mark(turn_id, "ts_tts_play_first", time.monotonic())
+                        first_chunk = False
+
+                    self.audio_player.enqueue(audio_chunk)
+                    self._add(turn_id, "tts_audio_total", (len(audio_chunk) / float(sr)) if sr > 0 else 0.0)
+                    synth_time = (timing.get("prefill_ms", 0.0) + timing.get("decode_ms", 0.0)) / 1000.0
+                    self._add(turn_id, "tts_synth_total", synth_time)
+            except Exception as exc:
+                print(f"[Error] TTS stream: {exc}")
+
     def run(self) -> None:
         workers = [
             threading.Thread(target=self.asr_worker, daemon=True),
             threading.Thread(target=self.llm_worker, daemon=True),
         ]
         if self.tts:
-            workers.append(threading.Thread(target=self.tts_synth_worker, daemon=True))
-            workers.append(threading.Thread(target=self.tts_play_worker, daemon=True))
+            workers.append(threading.Thread(target=self.tts_stream_worker, daemon=True))
         for worker in workers:
             worker.start()
 
@@ -1066,7 +1222,8 @@ class VoiceAssistant:
             print(f"[Config] ref_text_source={self.cfg.ref_text_source}")
         print(f"[Config] tts_non_streaming_mode={self.cfg.tts_non_streaming_mode}")
         print(
-            f"[Config] tts_chunk_max_len={self.cfg.tts_chunk_max_len} "
+            f"[Config] tts_stream_chunk_size={self.cfg.tts_stream_chunk_size} "
+            f"tts_chunk_max_len={self.cfg.tts_chunk_max_len} "
             f"batch_wait_ms={self.cfg.tts_batch_wait_ms}"
         )
         print(
@@ -1077,6 +1234,8 @@ class VoiceAssistant:
         print(f"[Config] asr_pause_during_tts={self.cfg.asr_pause_during_tts}")
 
         try:
+            if self.audio_player is not None:
+                self.audio_player.start()
             with sd.InputStream(
                 samplerate=self.cfg.sample_rate,
                 channels=self.cfg.channels,
@@ -1093,6 +1252,9 @@ class VoiceAssistant:
             pass
         finally:
             self.stop_event.set()
+            if self.audio_player is not None:
+                self.audio_player.clear()
+                self.audio_player.stop()
             time.sleep(0.5)
             print("Assistant stopped.")
 
