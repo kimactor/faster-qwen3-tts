@@ -98,7 +98,7 @@ class RuntimeConfig:
 
     interrupt_enable: bool = True
     interrupt_require_wake_word_when_busy: bool = True
-    interrupt_wake_words: Tuple[str, ...] = ("\u6253\u65ad", "\u5c0fQ")
+    interrupt_wake_words: Tuple[str, ...] = ("\u5c0f\u9165",)
     interrupt_min_query_chars: int = 3
 
     system_prompt: str = (
@@ -123,6 +123,8 @@ class RuntimeConfig:
     tts_stream_chunk_size: int = 8
     tts_chunk_max_len: int = 140
     tts_batch_wait_ms: int = 25
+    tts_stream_first_soft_chars: int = 8
+    tts_stream_first_force_chars: int = 18
     tts_stream_soft_chars: int = 18
     tts_stream_force_chars: int = 44
 
@@ -318,6 +320,9 @@ def build_runtime_config() -> RuntimeConfig:
         cfg.silence_sec = max(0.1, float(args.silence_sec))
     if args.serve_web:
         cfg.serve_web = True
+        # Web mode benefits more from earlier TTS flushing than absolute synthesis throughput.
+        cfg.tts_stream_soft_chars = 8
+        cfg.tts_stream_force_chars = 18
     if args.web_host is not None:
         cfg.web_host = args.web_host
     if args.web_port is not None:
@@ -1048,7 +1053,8 @@ class VoiceAssistant:
             "ttfa_ms": int(round((t4 - t0) * 1000.0)) if t0 and t4 else None,
             "tts_audio_s": round(audio, 3),
             "tts_synth_s": round(synth, 3),
-            "rtf": round((audio / synth), 3) if synth > 1e-6 else None,
+            "rtf": round((synth / audio), 3) if audio > 1e-6 else None,
+            "speed_ratio": round((audio / synth), 3) if synth > 1e-6 else None,
         }
         return payload
 
@@ -1093,6 +1099,21 @@ class VoiceAssistant:
             finally:
                 self.speaking_event.clear()
 
+    def _should_flush_tts_text(self, text: str, first_segment: bool) -> bool:
+        norm_len = len(self._normalize_text(text))
+        hard_stop = re.search(r"[\u3002\uff01\uff1f!?]\s*$", text) is not None
+        soft_stop = re.search(r"[\uff0c,\u3001\uff1b;\uff1a:\n]\s*$", text) is not None
+
+        soft_limit = int(self.cfg.tts_stream_soft_chars)
+        force_limit = int(self.cfg.tts_stream_force_chars)
+        if first_segment:
+            soft_limit = max(1, min(soft_limit, int(self.cfg.tts_stream_first_soft_chars)))
+            force_limit = max(1, min(force_limit, int(self.cfg.tts_stream_first_force_chars)))
+
+        force_flush = norm_len >= force_limit
+        soft_flush = norm_len >= soft_limit and soft_stop
+        return hard_stop or force_flush or soft_flush
+
     def stream_dialog(self, user_text: str):
         user_text = (user_text or "").strip()
         if not self._is_valid_user_text(user_text):
@@ -1106,6 +1127,7 @@ class VoiceAssistant:
             response = ""
             tts_buf = ""
             first_token_marked = False
+            first_tts_segment_pending = True
             interrupted = False
             tts_event_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
             tts_queue: queue.Queue[Optional[str]] = queue.Queue()
@@ -1160,14 +1182,10 @@ class VoiceAssistant:
                     }
 
                     if self.tts:
-                        norm_len = len(self._normalize_text(tts_buf))
-                        hard_stop = re.search(r"[\u3002\uff01\uff1f!?]\s*$", tts_buf) is not None
-                        soft_stop = re.search(r"[\uff0c,\u3001\uff1b;\uff1a:\n]\s*$", tts_buf) is not None
-                        force_flush = norm_len >= int(self.cfg.tts_stream_force_chars)
-                        soft_flush = norm_len >= int(self.cfg.tts_stream_soft_chars) and soft_stop
-                        if hard_stop or force_flush or soft_flush:
+                        if self._should_flush_tts_text(tts_buf, first_tts_segment_pending):
                             tts_queue.put(tts_buf)
                             tts_buf = ""
+                            first_tts_segment_pending = False
 
                     for event in drain_tts_events(wait=False):
                         yield event
@@ -1297,6 +1315,7 @@ class VoiceAssistant:
                 tts_buf = ""
                 tts_seq = 0
                 first_token_marked = False
+                first_tts_segment_pending = True
                 interrupted = False
 
                 for chunk in self.llm.stream_chat(messages):
@@ -1314,14 +1333,10 @@ class VoiceAssistant:
                     tts_buf += chunk
 
                     if self.tts:
-                        norm_len = len(self._normalize_text(tts_buf))
-                        hard_stop = re.search(r"[\u3002\uff01\uff1f!?]\s*$", tts_buf) is not None
-                        soft_stop = re.search(r"[\uff0c,\u3001\uff1b;\uff1a:\n]\s*$", tts_buf) is not None
-                        force_flush = norm_len >= int(self.cfg.tts_stream_force_chars)
-                        soft_flush = norm_len >= int(self.cfg.tts_stream_soft_chars) and soft_stop
-                        if hard_stop or force_flush or soft_flush:
+                        if self._should_flush_tts_text(tts_buf, first_tts_segment_pending):
                             tts_seq = self._enqueue_tts_segments(turn_id, epoch, tts_buf, tts_seq)
                             tts_buf = ""
+                            first_tts_segment_pending = False
 
                 self._mark(turn_id, "ts_llm_done", time.monotonic(), only_if_none=True)
                 print()
@@ -1611,6 +1626,10 @@ class VoiceAssistant:
             print(f"[Config] ref_text_source={self.cfg.ref_text_source}")
         print(f"[Config] tts_non_streaming_mode={self.cfg.tts_non_streaming_mode}")
         print(
+            f"[Config] tts_stream_first_soft_chars={self.cfg.tts_stream_first_soft_chars} "
+            f"tts_stream_first_force_chars={self.cfg.tts_stream_first_force_chars}"
+        )
+        print(
             f"[Config] tts_stream_chunk_size={self.cfg.tts_stream_chunk_size} "
             f"tts_chunk_max_len={self.cfg.tts_chunk_max_len} "
             f"batch_wait_ms={self.cfg.tts_batch_wait_ms}"
@@ -1762,6 +1781,13 @@ def run_websocket_server(cfg: RuntimeConfig) -> None:
             text = assistant.transcribe_audio_array(audio)
             if not assistant._is_valid_user_text(text):
                 emit({"type": "transcript", "text": ""})
+                return
+            if assistant.cfg.interrupt_enable and assistant._is_assistant_busy():
+                interrupt_query = assistant._extract_interrupt_query(text)
+                if not interrupt_query:
+                    emit({"type": "transcript", "text": ""})
+                    return
+                start_worker(interrupt_query, payload_meta, transcript=text)
                 return
             start_worker(text, payload_meta, transcript=text)
 
