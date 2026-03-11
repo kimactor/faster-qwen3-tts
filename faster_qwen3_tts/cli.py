@@ -422,15 +422,26 @@ def cmd_serve(args):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="faster-qwen3-tts", description="FasterQwen3TTS CLI")
-    p.add_argument("--device", default="cuda", help="Device (cuda or cpu)")
-    p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"], help="Model dtype")
+    default_model = os.environ.get("QWEN_TTS_MODEL")
+    p.add_argument("--device", default=os.environ.get("QWEN_TTS_DEVICE", "cuda"), help="Device (cuda or cpu)")
+    p.add_argument(
+        "--dtype",
+        default=os.environ.get("QWEN_TTS_DTYPE", "bf16"),
+        choices=["bf16", "fp16", "fp32"],
+        help="Model dtype",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp):
         sp.add_argument("--text", required=True, help="Text to synthesize")
         sp.add_argument("--language", default="Auto", help="Language (Auto, English, French, ...)" )
         sp.add_argument("--output", required=True, help="Output wav path")
-        sp.add_argument("--model", required=True, help="Model id or local path")
+        sp.add_argument(
+            "--model",
+            default=default_model,
+            required=default_model is None,
+            help="Model id or local path",
+        )
         sp.add_argument("--max-new-tokens", type=int, default=2048)
         sp.add_argument("--temperature", type=float, default=0.9)
         sp.add_argument("--top-k", type=int, default=50)
@@ -469,7 +480,12 @@ def build_parser():
     sp.set_defaults(fn=cmd_clone)
 
     sp = sub.add_parser("anchor", help="Export a reusable voice anchor JSON")
-    sp.add_argument("--model", required=True, help="Model id or local path")
+    sp.add_argument(
+        "--model",
+        default=default_model,
+        required=default_model is None,
+        help="Model id or local path",
+    )
     sp.add_argument("--ref-audio", required=True, help="Reference audio path")
     sp.add_argument("--ref-text", default="", help="Reference transcript (required for ICL)")
     sp.add_argument("--output", required=True, help="Output anchor JSON path")
@@ -490,7 +506,12 @@ def build_parser():
 
     sp = sub.add_parser("serve", help="Keep model hot and generate multiple requests from stdin")
     sp.add_argument("--mode", required=True, choices=["clone", "custom", "design"])
-    sp.add_argument("--model", required=True, help="Model id or local path")
+    sp.add_argument(
+        "--model",
+        default=default_model,
+        required=default_model is None,
+        help="Model id or local path",
+    )
     sp.add_argument("--language", default="Auto", help="Language (Auto, English, French, ...)")
     sp.add_argument("--ref-audio", help="Reference audio path (clone)")
     sp.add_argument("--ref-text", help="Reference transcript (clone)")

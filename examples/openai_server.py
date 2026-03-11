@@ -290,6 +290,7 @@ async def create_speech(req: SpeechRequest):
 
 
 def _parse_args():
+    default_model = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     p = argparse.ArgumentParser(
         description="OpenAI-compatible TTS server for faster-qwen3-tts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -297,8 +298,8 @@ def _parse_args():
     )
     p.add_argument(
         "--model",
-        default=os.environ.get("QWEN_TTS_MODEL", "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-Base"),
-        help="HuggingFace model ID or local path (default: Qwen/Qwen3-TTS-12Hz-1.7B-Base)",
+        default=default_model,
+        help=f"HuggingFace model ID or local path (default: {default_model})",
     )
     p.add_argument(
         "--voices",
@@ -326,11 +327,11 @@ def _parse_args():
     p.add_argument(
         "--language",
         default=os.environ.get("QWEN_TTS_LANGUAGE", "Auto"),
-        help="Target language (English, French, Auto, …) when --voices is not used",
+        help="Target language (English, French, Auto, etc.) when --voices is not used",
     )
-    p.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
-    p.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
-    p.add_argument("--device", default="cuda", help="Torch device (default: cuda)")
+    p.add_argument("--host", default=os.environ.get("QWEN_TTS_HOST", "0.0.0.0"), help="Bind host (default: 0.0.0.0)")
+    p.add_argument("--port", type=int, default=int(os.environ.get("QWEN_TTS_PORT", "8000")), help="Bind port (default: 8000)")
+    p.add_argument("--device", default=os.environ.get("QWEN_TTS_DEVICE", "cuda"), help="Torch device (default: cuda)")
     return p.parse_args()
 
 

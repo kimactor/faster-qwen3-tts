@@ -85,6 +85,8 @@ class RuntimeConfig:
     channels: int = 1
     block_size: int = 1024
     input_device_hint: str = ""
+    output_device_hint: str = ""
+    list_audio_devices: bool = False
     language: str = "Chinese"
 
     rms_threshold: float = 0.015
@@ -253,6 +255,8 @@ def build_runtime_config() -> RuntimeConfig:
     parser.add_argument("--ref-text-file", default=None, help="Load reference transcript from file")
     parser.add_argument("--language", default=None, help="ASR/TTS language")
     parser.add_argument("--input-device-hint", default=None, help="Substring matched against microphone name")
+    parser.add_argument("--output-device-hint", default=None, help="Substring matched against speaker/headphone name")
+    parser.add_argument("--list-audio-devices", action="store_true", help="Print audio devices and exit")
     parser.add_argument("--tts-chunk-size", type=int, default=None, help="Streaming TTS codec chunk size")
     parser.add_argument("--pronunciation-lexicon", default=None, help="Pronunciation/silent-symbol override file")
     parser.add_argument("--rag-backend", default="none", choices=["none", "json-keyword", "vector-index"], help="RAG backend for assistant context injection")
@@ -291,6 +295,10 @@ def build_runtime_config() -> RuntimeConfig:
         cfg.language = args.language
     if args.input_device_hint is not None:
         cfg.input_device_hint = args.input_device_hint
+    if args.output_device_hint is not None:
+        cfg.output_device_hint = args.output_device_hint
+    if args.list_audio_devices:
+        cfg.list_audio_devices = True
     if args.tts_chunk_size is not None:
         cfg.tts_stream_chunk_size = max(1, int(args.tts_chunk_size))
     if args.pronunciation_lexicon is not None:
@@ -726,8 +734,9 @@ class StreamingTTS:
 
 
 class AudioChunkPlayer:
-    def __init__(self, sample_rate: int):
+    def __init__(self, sample_rate: int, device: Optional[int] = None):
         self.sample_rate = int(sample_rate)
+        self.device = device
         self._lock = threading.Lock()
         self._drain = threading.Condition(self._lock)
         self._queued: deque[np.ndarray] = deque()
@@ -745,6 +754,7 @@ class AudioChunkPlayer:
             samplerate=self.sample_rate,
             channels=1,
             dtype="float32",
+            device=self.device,
             callback=self._callback,
         )
         self._stream.start()
@@ -836,7 +846,7 @@ class VoiceAssistant:
         self.text_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=8)
         self.tts_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=32)
         self.tts_ready_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=64)
-        self.audio_player = AudioChunkPlayer(self.tts.model.sample_rate) if self.tts else None
+        self.audio_player = None
         self.stop_event = threading.Event()
         self.speaking_event = threading.Event()
         self.llm_generating_event = threading.Event()
@@ -871,6 +881,51 @@ class VoiceAssistant:
                 print(f"[Audio] matched input device: {name}")
                 return idx
         return None
+
+    def _resolve_output_device(self) -> Optional[int]:
+        if sd is None:
+            return None
+        hint = (self.cfg.output_device_hint or "").strip().lower()
+        if not hint:
+            return None
+        try:
+            devices = sd.query_devices()
+        except Exception as exc:
+            print(f"[Warn] query devices failed: {exc}")
+            return None
+
+        for idx, dev in enumerate(devices):
+            name = str(dev.get("name", ""))
+            max_out = int(dev.get("max_output_channels", 0))
+            if max_out > 0 and hint in name.lower():
+                print(f"[Audio] matched output device: {name}")
+                return idx
+        print(f"[Warn] output device hint not matched: {self.cfg.output_device_hint}")
+        return None
+
+    def _print_audio_devices(self) -> None:
+        if sd is None:
+            print("[Warn] sounddevice is not installed")
+            return
+        try:
+            devices = sd.query_devices()
+            default_in, default_out = sd.default.device
+        except Exception as exc:
+            print(f"[Warn] query devices failed: {exc}")
+            return
+
+        print("[Audio] available devices:")
+        for idx, dev in enumerate(devices):
+            name = str(dev.get("name", ""))
+            max_in = int(dev.get("max_input_channels", 0))
+            max_out = int(dev.get("max_output_channels", 0))
+            tags = []
+            if idx == default_in:
+                tags.append("default-in")
+            if idx == default_out:
+                tags.append("default-out")
+            suffix = f" [{' '.join(tags)}]" if tags else ""
+            print(f"  {idx}: {name} (in={max_in}, out={max_out}){suffix}")
 
     def _build_messages(self, user_text: str) -> List[dict]:
         rag_chunks = self.rag.retrieve(user_text, top_k=self.cfg.rag_top_k, filters=self.cfg.rag_filters)
@@ -1587,6 +1642,15 @@ class VoiceAssistant:
     def run(self) -> None:
         if sd is None:
             raise RuntimeError("sounddevice is required for microphone/speaker realtime mode")
+        if self.cfg.list_audio_devices:
+            self._print_audio_devices()
+            return
+
+        input_device = self._resolve_input_device()
+        output_device = self._resolve_output_device()
+        if self.audio_player is None and self.tts:
+            self.audio_player = AudioChunkPlayer(self.tts.model.sample_rate, device=output_device)
+
         workers = [
             threading.Thread(target=self.asr_worker, daemon=True),
             threading.Thread(target=self.llm_worker, daemon=True),
@@ -1595,8 +1659,6 @@ class VoiceAssistant:
             workers.append(threading.Thread(target=self.tts_stream_worker, daemon=True))
         for worker in workers:
             worker.start()
-
-        input_device = self._resolve_input_device()
 
         print("====== Realtime ASR-LLM-FasterQwen3TTS Started ======")
         print("Speak naturally. Input q + Enter to quit.")
@@ -1612,6 +1674,8 @@ class VoiceAssistant:
         )
         print(f"[Config] pronunciation_lexicon={self.cfg.pronunciation_lexicon_path}")
         print(f"[Config] rag_backend={self.cfg.rag_backend} rag_source={self.cfg.rag_source or '-'}")
+        print(f"[Config] input_device_hint={self.cfg.input_device_hint or '-'}")
+        print(f"[Config] output_device_hint={self.cfg.output_device_hint or '-'}")
         if self.cfg.rag_index:
             print(f"[Config] rag_index={self.cfg.rag_index}")
         if self.cfg.rag_backend == "vector-index":
@@ -1658,6 +1722,8 @@ class VoiceAssistant:
                         break
         except KeyboardInterrupt:
             pass
+        except Exception as exc:
+            print(f"[Error] audio I/O: {exc}")
         finally:
             self.stop_event.set()
             if self.audio_player is not None:

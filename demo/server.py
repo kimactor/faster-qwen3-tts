@@ -47,11 +47,11 @@ from nano_parakeet import from_pretrained as _parakeet_from_pretrained
 
 
 _ALL_MODELS = [
-    "D:/work/QWen3/Qwen3-TTS-12Hz-0.6B-Base",
-    "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-Base",
-    "D:/work/QWen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-    "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    os.environ.get("QWEN_TTS_MODEL_06B", "Qwen/Qwen3-TTS-12Hz-0.6B-Base"),
+    os.environ.get("QWEN_TTS_MODEL_17B", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+    os.environ.get("QWEN_TTS_MODEL_CUSTOM_06B", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"),
+    os.environ.get("QWEN_TTS_MODEL_CUSTOM_17B", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+    os.environ.get("QWEN_TTS_MODEL_DESIGN_17B", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"),
 ]
 
 _active_models_env = os.environ.get("ACTIVE_MODELS", "")
@@ -686,11 +686,11 @@ def main():
     parser = argparse.ArgumentParser(description="Faster Qwen3-TTS Demo Server")
     parser.add_argument(
         "--model",
-        default="D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-Base",
+        default=os.environ.get("QWEN_TTS_DEMO_MODEL", os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")),
         help="Model to preload at startup (default: 1.7B-Base)",
     )
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 7860)))
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("QWEN_TTS_DEMO_PORT", os.environ.get("PORT", "7860"))))
+    parser.add_argument("--host", default=os.environ.get("QWEN_TTS_HOST", "0.0.0.0"))
     parser.add_argument(
         "--no-preload",
         action="store_true",
