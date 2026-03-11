@@ -195,7 +195,7 @@ python examples/realtime_voice_assistant.py \
   --tts-chunk-size 8
 ```
 
-If `narrator.anchor.json` or `<ref_audio>.anchor.json` exists, the assistant now auto-detects it and prefers it over rebuilding the reference prompt.
+If `<ref_audio>.<tts-model>.anchor.json`, `narrator.<tts-model>.anchor.json`, `narrator.anchor.json`, or `<ref_audio>.anchor.json` exists, the assistant auto-detects it and prefers it over rebuilding the reference prompt. If no matching anchor exists, the assistant now generates `<ref_audio>.<tts-model>.anchor.json` on first run.
 
 For local pure-text inference, use the original 4B checkpoint:
 

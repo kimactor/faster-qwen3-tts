@@ -41,7 +41,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from faster_qwen3_tts import FasterQwen3TTS
 from faster_qwen3_tts.text_processing import TextNormalizer, default_pronunciation_lexicon_path
-from rag_backends import build_rag_backend, format_rag_context, parse_metadata_filters
+try:
+    from examples.rag_backends import build_rag_backend, format_rag_context, parse_metadata_filters
+except ModuleNotFoundError:
+    from rag_backends import build_rag_backend, format_rag_context, parse_metadata_filters
 
 
 def _flash_attn_available() -> bool:
@@ -61,15 +64,17 @@ def _attn_impl(use_flash: bool) -> Optional[str]:
 class RuntimeConfig:
     asr_path: str = "D:/work/QWen3/Qwen3-ASR-1.7B"
     llm_path: str = "D:/work/QWen3/Qwen3-4B-Instruct-2507"
-    tts_model_key: str = "0.6b"
+    tts_model_key: str = "1.7b"
     tts_path_06b: str = "D:/work/QWen3/Qwen3-TTS-12Hz-0.6B-Base"
     tts_path_17b: str = "D:/work/QWen3/Qwen3-TTS-12Hz-1.7B-Base"
     tts_path: str = "D:/work/QWen3/Qwen3-TTS-12Hz-0.6B-Base"
     ref_audio: str = "ref_voice.wav"
     voice_anchor: str = ""
+    voice_anchor_target: str = ""
+    voice_anchor_user_supplied: bool = False
     ref_text: str = ""
     ref_text_source: str = ""
-    xvector_only_mode: bool = True
+    xvector_only_mode: bool = False
     pronunciation_lexicon_path: str = str(default_pronunciation_lexicon_path())
     rag_backend: str = "none"
     rag_source: str = ""
@@ -191,30 +196,63 @@ def _resolve_ref_text(
     return "", ""
 
 
-def _resolve_voice_anchor_path(
-    explicit_anchor: Optional[str],
-    ref_audio: Optional[str],
-) -> str:
+def _parse_voice_anchor_arg(explicit_anchor: Optional[str]) -> Tuple[Optional[str], bool, bool]:
     if explicit_anchor:
-        return explicit_anchor
+        raw = explicit_anchor.strip()
+        sentinel = Path(raw).name.lower()
+        if sentinel in {"-", "none", "null", "off", "disable"}:
+            return None, True, True
+        return raw, True, False
+    return None, False, False
 
+
+def _default_voice_anchor_path(ref_audio: Optional[str], model_key: str) -> str:
+    model_key = _normalize_tts_model_key(model_key)
+    if ref_audio:
+        ref_path = Path(ref_audio)
+        return str(ref_path.with_name(f"{ref_path.stem}.{model_key}.anchor.json"))
+    return str(Path(f"narrator.{model_key}.anchor.json"))
+
+
+def _voice_anchor_candidates(ref_audio: Optional[str], model_key: str) -> List[Path]:
+    model_key = _normalize_tts_model_key(model_key)
     candidates: List[Path] = []
     if ref_audio:
         ref_path = Path(ref_audio)
-        candidates.append(ref_path.with_suffix(".anchor.json"))
-        candidates.append(ref_path.parent / "narrator.anchor.json")
-    candidates.append(Path("narrator.anchor.json"))
+        candidates.extend(
+            [
+                ref_path.with_name(f"{ref_path.stem}.{model_key}.anchor.json"),
+                ref_path.with_suffix(".anchor.json"),
+                ref_path.parent / f"narrator.{model_key}.anchor.json",
+                ref_path.parent / "narrator.anchor.json",
+            ]
+        )
+    candidates.extend([Path(f"narrator.{model_key}.anchor.json"), Path("narrator.anchor.json")])
+    return candidates
+
+
+def _resolve_voice_anchor_path(
+    explicit_anchor: Optional[str],
+    ref_audio: Optional[str],
+    model_key: str,
+) -> Tuple[str, str, bool]:
+    parsed_anchor, is_explicit, is_disabled = _parse_voice_anchor_arg(explicit_anchor)
+    if is_disabled:
+        return "", "", is_explicit
+    target_path = parsed_anchor or _default_voice_anchor_path(ref_audio, model_key)
+    if parsed_anchor:
+        return parsed_anchor, target_path, is_explicit
 
     seen = set()
-    for candidate in candidates:
+    for candidate in _voice_anchor_candidates(ref_audio, model_key):
         normalized = str(candidate.resolve()) if candidate.exists() else str(candidate)
         if normalized in seen:
             continue
         seen.add(normalized)
         if candidate.exists():
-            return str(candidate)
+            return str(candidate), target_path, is_explicit
 
-    return ""
+    return target_path, target_path, is_explicit
 
 
 def apply_tts_model_preset(cfg: RuntimeConfig, model_key: str) -> RuntimeConfig:
@@ -246,7 +284,7 @@ def build_runtime_config() -> RuntimeConfig:
     parser = argparse.ArgumentParser(description="Realtime ASR + LLM + FasterQwen3TTS assistant")
     parser.add_argument("--asr-path", default=None, help="ASR model path")
     parser.add_argument("--llm-path", default=None, help="LLM model path")
-    parser.add_argument("--tts-model", default="0.6b", choices=["0.6b", "1.7b"], help="TTS preset")
+    parser.add_argument("--tts-model", default="1.7b", choices=["0.6b", "1.7b"], help="TTS preset")
     parser.add_argument("--tts-path", default=None, help="Override TTS model path")
     parser.add_argument("--tts-attn-implementation", default=None, choices=["eager", "sdpa", "flash_attention_2"])
     parser.add_argument("--ref-audio", default=None, help="Reference audio path for voice clone")
@@ -290,7 +328,11 @@ def build_runtime_config() -> RuntimeConfig:
         cfg.tts_attn_implementation = args.tts_attn_implementation
     if args.ref_audio:
         cfg.ref_audio = args.ref_audio
-    cfg.voice_anchor = _resolve_voice_anchor_path(args.voice_anchor, cfg.ref_audio)
+    cfg.voice_anchor, cfg.voice_anchor_target, cfg.voice_anchor_user_supplied = _resolve_voice_anchor_path(
+        args.voice_anchor,
+        cfg.ref_audio,
+        cfg.tts_model_key,
+    )
     if args.language:
         cfg.language = args.language
     if args.input_device_hint is not None:
@@ -355,7 +397,8 @@ def build_runtime_config() -> RuntimeConfig:
     else:
         cfg.xvector_only_mode = not bool((cfg.ref_text or "").strip())
 
-    if not cfg.voice_anchor and not cfg.xvector_only_mode and not (cfg.ref_text or "").strip():
+    voice_anchor_exists = bool(cfg.voice_anchor and os.path.exists(cfg.voice_anchor))
+    if not voice_anchor_exists and not cfg.xvector_only_mode and not (cfg.ref_text or "").strip():
         raise ValueError("ICL mode requires --ref-text or a matching <ref_audio>.txt/<ref_audio>.lab file")
 
     return cfg
@@ -669,13 +712,78 @@ class StreamingTTS:
         print(f"[Init] TTS sample_rate={self.model.sample_rate}")
 
         if cfg.voice_anchor:
-            if not os.path.exists(cfg.voice_anchor):
-                raise FileNotFoundError(f"voice anchor not found: {cfg.voice_anchor}")
+            self._prepare_voice_anchor()
         else:
             if not os.path.exists(cfg.ref_audio):
                 raise FileNotFoundError(f"ref audio not found: {cfg.ref_audio}")
         if not cfg.voice_anchor and not cfg.xvector_only_mode and not (cfg.ref_text or "").strip():
             raise ValueError("ref_text is required when xvector_only_mode is False")
+
+    def _anchor_matches_current_model(self, anchor_path: str) -> bool:
+        try:
+            payload = self.model.load_voice_anchor(anchor_path)
+        except Exception:
+            return True
+
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        anchor_model_key = str(metadata.get("tts_model_key", "")).strip()
+        if anchor_model_key:
+            try:
+                return _normalize_tts_model_key(anchor_model_key) == self.cfg.tts_model_key
+            except ValueError:
+                return False
+
+        # Legacy generic anchors (without model tag/metadata) are treated as non-model-specific.
+        model_tag = f".{self.cfg.tts_model_key}.anchor.json"
+        return model_tag in Path(anchor_path).name.lower()
+
+    def _prepare_voice_anchor(self) -> None:
+        if not os.path.exists(self.cfg.ref_audio):
+            raise FileNotFoundError(f"ref audio not found: {self.cfg.ref_audio}")
+
+        current_anchor = (self.cfg.voice_anchor or "").strip()
+        target_anchor = (self.cfg.voice_anchor_target or current_anchor).strip()
+        if not target_anchor:
+            target_anchor = _default_voice_anchor_path(self.cfg.ref_audio, self.cfg.tts_model_key)
+            self.cfg.voice_anchor_target = target_anchor
+        if not current_anchor:
+            current_anchor = target_anchor
+            self.cfg.voice_anchor = current_anchor
+
+        if os.path.exists(current_anchor):
+            try:
+                self.model.validate_voice_anchor(current_anchor)
+                if self._anchor_matches_current_model(current_anchor):
+                    return
+                raise ValueError(
+                    f"voice anchor does not match current model key={self.cfg.tts_model_key}: {current_anchor}"
+                )
+            except ValueError as exc:
+                if self.cfg.voice_anchor_user_supplied:
+                    raise
+                print(f"[Warn] voice anchor incompatible, regenerating for {self.cfg.tts_model_key}: {exc}")
+                self.cfg.voice_anchor = target_anchor
+                current_anchor = target_anchor
+
+        if not self.cfg.xvector_only_mode and not (self.cfg.ref_text or "").strip():
+            raise ValueError("ref_text is required to generate an ICL voice anchor")
+
+        metadata = {
+            "tts_model_key": self.cfg.tts_model_key,
+            "tts_path": self.cfg.tts_path,
+            "ref_audio": self.cfg.ref_audio,
+            "ref_text_source": self.cfg.ref_text_source,
+        }
+        print(f"[Init] generating voice anchor: {current_anchor}")
+        self.model.save_voice_anchor(
+            current_anchor,
+            ref_audio=self.cfg.ref_audio,
+            ref_text=self.cfg.ref_text,
+            xvec_only=self.cfg.xvector_only_mode,
+            metadata=metadata,
+        )
+        self.model.validate_voice_anchor(current_anchor)
 
     def synthesize(self, text: str) -> Optional[Tuple[np.ndarray, int]]:
         text = (text or "").strip()

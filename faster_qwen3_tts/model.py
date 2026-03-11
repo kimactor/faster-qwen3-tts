@@ -181,11 +181,15 @@ class FasterQwen3TTS:
             anchor_ref_text = prompt_items[0].ref_text or ref_text
 
         spk_emb = prompt_items[0].ref_spk_embedding
+        spk_emb_np = self._decode_array_payload(self._encode_array_payload(spk_emb))
         return {
             "format": "faster_qwen3_tts.voice_anchor.v1",
             "xvec_only": bool(xvec_only),
             "append_silence": bool(append_silence),
             "ref_text": anchor_ref_text,
+            "speaker_embedding_dim": int(np.asarray(spk_emb_np).shape[-1]),
+            "tts_model_type": getattr(self.model.model, "tts_model_type", ""),
+            "tts_model_size": getattr(self.model.model, "tts_model_size", ""),
             "speaker_embedding": self._encode_array_payload(spk_emb),
             "ref_codes": self._encode_array_payload(ref_codes),
             "metadata": metadata or {},
@@ -218,6 +222,35 @@ class FasterQwen3TTS:
         if payload.get("format") != "faster_qwen3_tts.voice_anchor.v1":
             raise ValueError("Unsupported voice anchor format")
         return payload
+
+    def expected_speaker_embedding_dim(self) -> int:
+        embeddings = self.model.model.talker.get_input_embeddings()
+        if hasattr(embeddings, "embedding_dim"):
+            return int(embeddings.embedding_dim)
+        return int(embeddings.weight.shape[-1])
+
+    def validate_voice_anchor(self, voice_anchor: Optional[Union[str, Path, dict]]) -> Optional[dict]:
+        anchor = self._resolve_voice_anchor(voice_anchor)
+        if anchor is None:
+            return None
+
+        spk_emb = self._decode_array_payload(anchor.get("speaker_embedding"))
+        if spk_emb is None:
+            raise ValueError("Voice anchor is missing speaker_embedding")
+
+        actual_dim = int(np.asarray(spk_emb).shape[-1])
+        expected_dim = self.expected_speaker_embedding_dim()
+        if actual_dim != expected_dim:
+            anchor_model = anchor.get("tts_model_size") or "unknown"
+            current_model = getattr(self.model.model, "tts_model_size", "unknown")
+            raise ValueError(
+                "Voice anchor is incompatible with the current TTS model: "
+                f"anchor speaker_embedding dim={actual_dim}, current model expects {expected_dim}. "
+                f"anchor_model={anchor_model}, current_model={current_model}. "
+                "Please regenerate the anchor with the current TTS model, or remove the voice anchor and use ref_audio directly."
+            )
+
+        return anchor
 
     def _voice_anchor_to_prompt(self, anchor: dict) -> tuple[dict, list]:
         spk_emb = self._decode_array_payload(anchor.get("speaker_embedding"))
